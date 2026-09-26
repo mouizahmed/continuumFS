@@ -1,0 +1,25 @@
+[package]
+name = "ctm-store"
+description = "Continuum storage backends and local caches"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+ctm-core.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+object_store.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
