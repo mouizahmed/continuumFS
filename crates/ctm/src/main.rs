@@ -3,9 +3,9 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-// Used by the commands as they land (M1–M3).
-#[allow(dead_code)]
+mod commands;
 mod config;
+// Used by the mount commands as they land (M2–M3).
 #[allow(dead_code)]
 mod control;
 #[allow(dead_code)]
@@ -128,7 +128,13 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_env("RUST_LOG"))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .without_time()
+        .with_target(false)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_writer(std::io::stderr)
         .init();
 
@@ -151,16 +157,23 @@ fn main() -> ExitCode {
 
 async fn run(command: Command) -> Result<()> {
     match command {
-        Command::Init { .. } => todo!("M1: ctm init"),
-        Command::Import { .. } => todo!("M1: ctm import"),
-        Command::Export { .. } => todo!("M1: ctm export"),
-        Command::Ls { .. } => todo!("M1: ctm ls"),
-        Command::Cat { .. } => todo!("M1: ctm cat"),
-        Command::Fork { .. } => todo!("M1: ctm fork"),
-        Command::Branch(BranchCommand::List) => todo!("M1: ctm branch list"),
-        Command::Snapshot(_) => todo!("M1: ctm snapshot"),
-        Command::Log { .. } => todo!("M1: ctm log"),
-        Command::Diff { .. } => todo!("M1: ctm diff"),
+        Command::Init { url, endpoint } => commands::init(&url, endpoint.as_deref()).await,
+        Command::Import {
+            dir,
+            branch,
+            message,
+        } => commands::import(&dir, &branch, &message).await,
+        Command::Export { spec, dir } => commands::export(&spec, &dir).await,
+        Command::Ls { spec } => commands::ls(&spec).await,
+        Command::Cat { spec } => commands::cat(&spec).await,
+        Command::Fork { from, new } => commands::fork(&from, &new).await,
+        Command::Branch(BranchCommand::List) => commands::branch_list().await,
+        Command::Snapshot(SnapshotCommand::Create { name, from }) => {
+            commands::snapshot_create(&name, from.as_deref()).await
+        }
+        Command::Snapshot(SnapshotCommand::List) => commands::snapshot_list().await,
+        Command::Log { spec, path } => commands::log(&spec, path.as_deref()).await,
+        Command::Diff { a, b, stat } => commands::diff(&a, &b, stat).await,
         Command::Mount { .. } => todo!("M2: ctm mount"),
         Command::MountProcess { .. } => todo!("M2: mount process"),
         Command::Cache(CacheCommand::Stats { .. }) => todo!("M2: ctm cache stats"),

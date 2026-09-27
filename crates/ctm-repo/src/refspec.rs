@@ -24,7 +24,29 @@ impl FromStr for RefSpec {
     type Err = crate::Error;
 
     fn from_str(s: &str) -> crate::Result<RefSpec> {
-        let _ = s;
-        todo!("M1: ref syntax")
+        let bad = || crate::Error::UnknownRef(s.to_string());
+        let (target, path) = match s.split_once(':') {
+            Some((t, p)) => (t, (!p.is_empty()).then_some(p)),
+            None => (s, None),
+        };
+        if path.is_some_and(|p| p.starts_with('/')) {
+            return Err(bad());
+        }
+        let target = if let Some(snap) = target.strip_prefix("snap/") {
+            RefTarget::Snapshot(BranchName::new(snap).map_err(|_| bad())?)
+        } else if target.len() >= 8
+            && target.len() <= 64
+            && target
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            RefTarget::CommitPrefix(target.to_string())
+        } else {
+            RefTarget::Branch(BranchName::new(target).map_err(|_| bad())?)
+        };
+        Ok(RefSpec {
+            target,
+            path: path.map(|p| p.trim_end_matches('/').to_string()),
+        })
     }
 }

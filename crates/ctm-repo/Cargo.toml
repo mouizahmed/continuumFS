@@ -12,14 +12,18 @@ publish.workspace = true
 ctm-core.workspace = true
 ctm-store.workspace = true
 bytes.workspace = true
+futures.workspace = true
+getrandom.workspace = true
 hex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 tempfile.workspace = true
 
 [lints]

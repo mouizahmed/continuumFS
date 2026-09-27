@@ -1,6 +1,8 @@
 //! `~/.config/continuum/config.toml`: this machine's ID and the repos it is connected to.
 
 use std::collections::BTreeMap;
+use std::fs;
+use std::io;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -40,19 +42,73 @@ impl Default for CacheConfig {
 
 impl LocalConfig {
     /// Loads the config, creating it with a new machine ID if it doesn't exist.
-    pub fn load_or_create(path: &Path) -> std::io::Result<LocalConfig> {
-        let _ = path;
-        todo!("M1: LocalConfig::load_or_create")
+    pub fn load_or_create(path: &Path) -> io::Result<LocalConfig> {
+        match fs::read_to_string(path) {
+            Ok(text) => toml::from_str(&text).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{}: {e}", path.display()),
+                )
+            }),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                let config = LocalConfig {
+                    machine_id: uuid::Uuid::new_v4().to_string(),
+                    ..LocalConfig::default()
+                };
+                config.save(path)?;
+                Ok(config)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Records a repo as `[repos.<last URL path component>]` and makes it the default.
     pub fn connect(&mut self, url: &str, endpoint: Option<&str>) -> String {
-        let _ = (url, endpoint);
-        todo!("M1: LocalConfig::connect")
+        let name = url
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("default")
+            .to_string();
+        self.repos.insert(
+            name.clone(),
+            RepoEntry {
+                url: url.to_string(),
+                endpoint: endpoint.map(str::to_string),
+            },
+        );
+        self.default_repo = Some(name.clone());
+        name
     }
 
-    pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        let _ = path;
-        todo!("M1: LocalConfig::save")
+    /// The default repo, or an error telling the user to run `ctm init`.
+    pub fn default_repo(&self) -> io::Result<(&str, &RepoEntry)> {
+        self.default_repo
+            .as_deref()
+            .and_then(|name| self.repos.get(name).map(|e| (name, e)))
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "no repo configured; run `ctm init <url>` first",
+                )
+            })
+    }
+
+    /// The machine ID as 16 bytes.
+    pub fn machine_id(&self) -> io::Result<[u8; 16]> {
+        uuid::Uuid::parse_str(&self.machine_id)
+            .map(|u| *u.as_bytes())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("machine_id: {e}")))
+    }
+
+    /// Writes the config atomically (temp file, then rename).
+    pub fn save(&self, path: &Path) -> io::Result<()> {
+        let dir = path.parent().expect("config path has a parent");
+        fs::create_dir_all(dir)?;
+        let text = toml::to_string_pretty(self)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        let tmp = dir.join(".config.toml.tmp");
+        fs::write(&tmp, text)?;
+        fs::rename(&tmp, path)
     }
 }

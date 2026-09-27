@@ -6,12 +6,14 @@ pub mod config;
 pub mod refs;
 pub mod refspec;
 mod repo;
+mod time;
 
 pub use check::check;
 pub use config::RepoConfig;
 pub use refs::{BranchName, BranchRef, ForkedFrom, SnapshotRef};
 pub use refspec::RefSpec;
-pub use repo::{Identity, InitOutcome, PathChange, Repo, Resolved};
+pub use repo::{Identity, Imported, InitOutcome, PathChange, Repo, Resolved};
+pub use time::rfc3339;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

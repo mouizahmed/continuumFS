@@ -16,8 +16,20 @@ pub struct BranchName(String);
 
 impl BranchName {
     pub fn new(name: &str) -> crate::Result<BranchName> {
-        let _ = name;
-        todo!("M1: name validation")
+        let chars_ok = name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+        let looks_like_commit = name.len() >= 8 && name.bytes().all(|b| b.is_ascii_hexdigit());
+        let valid = (1..=100).contains(&name.len())
+            && chars_ok
+            && !name.starts_with(['.', '-'])
+            && !name.contains("..")
+            && !looks_like_commit;
+        if valid {
+            Ok(BranchName(name.to_string()))
+        } else {
+            Err(crate::Error::InvalidName(name.to_string()))
+        }
     }
 
     pub fn as_str(&self) -> &str {
