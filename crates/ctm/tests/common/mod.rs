@@ -105,3 +105,40 @@ pub fn write(root: &Path, rel: &str, data: &str) {
     fs::create_dir_all(p.parent().unwrap()).unwrap();
     fs::write(p, data).unwrap();
 }
+
+/// A test that fails mid-way must not leave mounts behind: stop every mount process this
+/// environment started, then detach anything still mounted under it.
+impl Drop for Env {
+    fn drop(&mut self) {
+        let mounts = self.home.join(".local/share/continuum/mounts");
+        for state in fs::read_dir(mounts).into_iter().flatten().flatten() {
+            let Ok(record) = fs::read(state.path().join("mount.json")) else {
+                continue;
+            };
+            let record: serde_json::Value = serde_json::from_slice(&record).unwrap_or_default();
+            // Only a live mount process of this environment: a stale PID may be reused.
+            let ours = |pid: u64| {
+                fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|c| {
+                    let c = String::from_utf8_lossy(&c);
+                    c.contains("mount-process") && c.contains(&*state.path().to_string_lossy())
+                })
+            };
+            if let Some(pid) = record["pid"].as_u64().filter(|p| ours(*p)) {
+                let _ = Command::new("kill").arg(pid.to_string()).status();
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while Path::new(&format!("/proc/{pid}")).exists()
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        }
+        let root = self.work.to_string_lossy().into_owned();
+        let info = fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+        for m in info.lines().filter_map(|l| l.split(' ').nth(4)) {
+            if m.starts_with(&root) {
+                let _ = Command::new("fusermount3").args(["-u", "-z", m]).status();
+            }
+        }
+    }
+}
