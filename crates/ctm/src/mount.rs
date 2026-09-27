@@ -105,6 +105,21 @@ fn unescape_mountinfo(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// `fusermount3 -u` (with `-z`, a lazy detach that succeeds even while files are open).
+fn fusermount(mountpoint: &Path, lazy: bool) -> std::result::Result<(), String> {
+    let mut cmd = Command::new("fusermount3");
+    cmd.arg("-u");
+    if lazy {
+        cmd.arg("-z");
+    }
+    let out = cmd.arg(mountpoint).output().map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
 /// Detaches a mount whose process is gone (`Transport endpoint is not connected`).
 fn clear_stale(mountpoint: &Path) -> Result<()> {
     if !is_mounted(mountpoint) {
@@ -279,6 +294,8 @@ pub async fn run(state_dir: PathBuf) -> Result<()> {
     let _ = fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket)?;
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    // Set once `ctm unmount` has detached the mount; a signal detaches it lazily instead.
+    let mut unmounted = false;
     loop {
         tokio::select! {
             conn = listener.accept() => {
@@ -300,6 +317,7 @@ pub async fn run(state_dir: PathBuf) -> Result<()> {
                 out.push(b'\n');
                 let _ = write.write_all(&out).await;
                 if stop {
+                    unmounted = true;
                     break;
                 }
             }
@@ -309,7 +327,12 @@ pub async fn run(state_dir: PathBuf) -> Result<()> {
     }
     drop(listener);
     let _ = fs::remove_file(&socket);
-    tokio::task::spawn_blocking(move || session.umount_and_join()).await??;
+    if !unmounted {
+        // Exiting on a signal: detach even if files are open, so no dead mount stays behind.
+        let _ = fusermount(&record.mountpoint, true);
+    }
+    // The kernel has let go of the mount, so the session ends; wait for it.
+    tokio::task::spawn_blocking(move || session.join()).await??;
     drop(state);
     if !keeps_state(&record) {
         fs::remove_dir_all(&state_dir)?;
@@ -393,24 +416,34 @@ async fn handle(
                 Err(e) => (error(e), false),
             }
         }
-        Request::Unmount { commit: true } if !state.read_only() => {
-            match commit(state, record, "").await {
-                Response::Ok { .. } => (
+        Request::Unmount {
+            commit: wants_commit,
+        } => {
+            if *wants_commit
+                && !state.read_only()
+                && let Response::Error { message } = commit(state, record, "").await
+            {
+                return (
+                    error(format!(
+                        "{message}; still mounted (retry, or pass --no-commit)"
+                    )),
+                    false,
+                );
+            }
+            match fusermount(&record.mountpoint, false) {
+                Ok(()) => (
                     ok(format!("Unmounted {}", record.mountpoint.display())),
                     true,
                 ),
-                Response::Error { message } => (
+                Err(e) => (
                     error(format!(
-                        "{message}; still mounted (retry, or pass --no-commit)"
+                        "{} is busy; close the files open in it and retry ({e})",
+                        record.mountpoint.display()
                     )),
                     false,
                 ),
             }
         }
-        Request::Unmount { .. } => (
-            ok(format!("Unmounted {}", record.mountpoint.display())),
-            true,
-        ),
     }
 }
 

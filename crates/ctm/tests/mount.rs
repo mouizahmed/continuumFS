@@ -348,3 +348,360 @@ fn restore_replaces_a_path_inside_a_mount() {
     );
     env.ok(&["unmount", &env.path("mnt")]);
 }
+
+// M4: hardening.
+
+fn errno_of<T>(r: std::io::Result<T>) -> Option<i32> {
+    r.err().and_then(|e| e.raw_os_error())
+}
+
+#[test]
+fn unsupported_calls_fail_with_the_documented_errors() {
+    use rustix::fs::{CWD, FallocateFlags, FileType, Mode, RenameFlags};
+    if !fuse_available() {
+        return;
+    }
+    let env = Env::new();
+    repo_with_main(&env);
+    let mnt = env.work.join("mnt");
+    fs::create_dir(&mnt).unwrap();
+    env.ok(&["mount", "main", &env.path("mnt")]);
+    let (a, b) = (mnt.join("notes.txt"), mnt.join("project/README.md"));
+
+    // chown to yourself is a no-op; to anyone else, EPERM.
+    let (uid, gid) = (
+        rustix::process::getuid().as_raw(),
+        rustix::process::getgid().as_raw(),
+    );
+    std::os::unix::fs::chown(&a, Some(uid), Some(gid)).unwrap();
+    if uid != 0 {
+        assert_eq!(
+            errno_of(std::os::unix::fs::chown(&a, Some(uid + 1), None)),
+            Some(1)
+        );
+    }
+    // RENAME_EXCHANGE is refused; RENAME_NOREPLACE works.
+    let exchange = rustix::fs::renameat_with(CWD, &a, CWD, &b, RenameFlags::EXCHANGE);
+    assert_eq!(exchange.err().map(|e| e.raw_os_error()), Some(22), "EINVAL");
+    let noreplace = rustix::fs::renameat_with(CWD, &a, CWD, &b, RenameFlags::NOREPLACE);
+    assert_eq!(
+        noreplace.err().map(|e| e.raw_os_error()),
+        Some(17),
+        "EEXIST"
+    );
+    rustix::fs::renameat_with(CWD, &a, CWD, mnt.join("moved.txt"), RenameFlags::NOREPLACE).unwrap();
+    // fallocate, FIFOs, hard links, and xattrs aren't supported; mknod of a file is.
+    let f = fs::OpenOptions::new()
+        .write(true)
+        .open(mnt.join("moved.txt"))
+        .unwrap();
+    let r = rustix::fs::fallocate(&f, FallocateFlags::empty(), 0, 4096);
+    assert_eq!(r.err().map(|e| e.raw_os_error()), Some(95), "EOPNOTSUPP");
+    rustix::fs::mknodat(
+        CWD,
+        mnt.join("plain"),
+        FileType::RegularFile,
+        Mode::from(0o644),
+        0,
+    )
+    .unwrap();
+    assert_eq!(fs::metadata(mnt.join("plain")).unwrap().len(), 0);
+    let fifo = rustix::fs::mknodat(CWD, mnt.join("fifo"), FileType::Fifo, Mode::from(0o644), 0);
+    assert_eq!(fifo.err().map(|e| e.raw_os_error()), Some(95), "EOPNOTSUPP");
+    assert_eq!(
+        errno_of(fs::hard_link(mnt.join("plain"), mnt.join("hard"))),
+        Some(1)
+    );
+    let xattr = rustix::fs::setxattr(
+        mnt.join("plain"),
+        "user.x",
+        b"1",
+        rustix::fs::XattrFlags::empty(),
+    );
+    assert_eq!(xattr.err().map(|e| e.raw_os_error()), Some(95), "ENOTSUP");
+
+    // Unmounting with a file open fails cleanly and leaves the mount working.
+    let err = env.fails(&["unmount", &env.path("mnt")]);
+    assert!(err.contains("busy"), "{err}");
+    assert!(is_mounted(&mnt));
+    assert!(fs::metadata(mnt.join("plain")).is_ok());
+    drop(f);
+    env.ok(&["unmount", &env.path("mnt")]);
+}
+
+fn xorshift(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+/// fsx-style: random pread/pwrite/truncate/fsync/reopen through the kernel, every read
+/// checked against a model, with commits and remounts along the way. mmap isn't a v0 test
+/// target. `CTM_FSX_OPS` sets the number of operations (default 5000).
+#[test]
+fn fsx_random_operations_match_a_model() {
+    use std::os::unix::fs::FileExt;
+    if !fuse_available() {
+        return;
+    }
+    let ops: usize = std::env::var("CTM_FSX_OPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5000);
+    let env = Env::new();
+    env.init();
+    let src = env.work.join("src");
+    fs::create_dir(&src).unwrap();
+    let mut model = random_bytes(11, 3 << 20);
+    fs::write(src.join("fsx.bin"), &model).unwrap();
+    env.ok(&["import", &env.path("src"), "--branch", "main"]);
+    let mnt = env.work.join("mnt");
+    fs::create_dir(&mnt).unwrap();
+    env.ok(&["mount", "main", &env.path("mnt")]);
+    let path = mnt.join("fsx.bin");
+    let open = || {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap()
+    };
+    let mut file = open();
+    let mut rng = 0x5eed_u64;
+    const MAX_LEN: u64 = 8 << 20;
+    // About 100 commits and 20 remounts whatever the length: v0 has no GC, so every commit
+    // stays in the bucket.
+    let commit_every = (ops / 100).max(1000);
+    let remount_every = (ops / 20).max(2500);
+    for op in 0..ops {
+        let r = xorshift(&mut rng);
+        let len = model.len() as u64;
+        match r % 100 {
+            0..40 => {
+                let at = xorshift(&mut rng) % MAX_LEN;
+                let n = (xorshift(&mut rng) % 65536 + 1).min(MAX_LEN - at) as usize;
+                let data = random_bytes(xorshift(&mut rng), n);
+                file.write_all_at(&data, at).unwrap();
+                if model.len() < at as usize + n {
+                    model.resize(at as usize + n, 0);
+                }
+                model[at as usize..at as usize + n].copy_from_slice(&data);
+            }
+            40..80 => {
+                let at = xorshift(&mut rng) % (len + 1);
+                let n = (xorshift(&mut rng) % 262_144) as usize;
+                let mut buf = vec![0; n];
+                let mut got = 0;
+                while got < n {
+                    match file.read_at(&mut buf[got..], at + got as u64).unwrap() {
+                        0 => break,
+                        k => got += k,
+                    }
+                }
+                let end = (at as usize + n).min(model.len());
+                assert!(
+                    buf[..got] == model[at as usize..end],
+                    "op {op}: read({at}, {n}) differs"
+                );
+            }
+            80..88 => {
+                let n = xorshift(&mut rng) % MAX_LEN;
+                file.set_len(n).unwrap();
+                model.resize(n as usize, 0);
+            }
+            88..92 => file.sync_data().unwrap(),
+            92..97 => {
+                drop(file);
+                file = open();
+            }
+            _ => {
+                assert_eq!(
+                    file.metadata().unwrap().len(),
+                    model.len() as u64,
+                    "op {op}"
+                );
+            }
+        }
+        if op % commit_every == commit_every - 1 {
+            env.ok(&["commit", &env.path("mnt")]);
+        }
+        if op % remount_every == remount_every - 1 {
+            drop(file);
+            let args: &[&str] = if (op / remount_every) % 2 == 1 {
+                &["unmount", "--no-commit", &env.path("mnt")]
+            } else {
+                &["unmount", &env.path("mnt")]
+            };
+            env.ok(args);
+            env.ok(&["mount", "main", &env.path("mnt")]);
+            file = open();
+        }
+    }
+    drop(file);
+    assert!(fs::read(&path).unwrap() == model, "final contents differ");
+    env.ok(&["unmount", &env.path("mnt")]);
+    let out = env.run(&["cat", "main:fsx.bin"]);
+    assert!(out.stdout == model, "committed contents differ");
+}
+
+/// A real workload: clone this repo and build a crate inside a mount, then again after a
+/// remount.
+#[test]
+fn git_clone_and_cargo_build_work_inside_a_mount() {
+    if !fuse_available() {
+        return;
+    }
+    let have = |tool: &str| {
+        Command::new(tool)
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    if !have("git") || !have("cargo") {
+        eprintln!("skipped: needs git and cargo");
+        return;
+    }
+    let env = Env::new();
+    env.init();
+    let src = env.work.join("src");
+    fs::create_dir(&src).unwrap();
+    env.ok(&["import", &env.path("src"), "--branch", "main"]);
+    let mnt = env.work.join("mnt");
+    fs::create_dir(&mnt).unwrap();
+    env.ok(&["mount", "main", &env.path("mnt")]);
+
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let run = |dir: &Path, cmd: &str, args: &[&str]| {
+        let out = Command::new(cmd)
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{cmd} {args:?} failed:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    run(
+        &mnt,
+        "git",
+        &[
+            "clone",
+            "--quiet",
+            "--no-hardlinks",
+            workspace.to_str().unwrap(),
+            "repo",
+        ],
+    );
+    let repo = mnt.join("repo");
+    assert_eq!(run(&repo, "git", &["status", "--porcelain"]), "");
+    run(&repo, "git", &["fsck", "--no-progress"]);
+
+    run(&mnt, "cargo", &["new", "--quiet", "--vcs", "none", "hello"]);
+    let hello = mnt.join("hello");
+    run(&hello, "cargo", &["build", "--quiet", "--offline"]);
+    assert_eq!(run(&hello, "./target/debug/hello", &[]), "Hello, world!\n");
+
+    env.ok(&["unmount", &env.path("mnt")]);
+    env.ok(&["mount", "main", &env.path("mnt")]);
+    assert_eq!(run(&repo, "git", &["status", "--porcelain"]), "");
+    assert_eq!(run(&hello, "./target/debug/hello", &[]), "Hello, world!\n");
+    run(&hello, "cargo", &["build", "--quiet", "--offline"]);
+    env.ok(&["unmount", &env.path("mnt")]);
+}
+
+/// `kill -9` of the mount process in the middle of a commit, at a few different moments:
+/// after a remount the branch is at the old commit or the new one, and committing again
+/// never forks.
+#[test]
+fn kill_9_during_a_commit_recovers_without_a_fork() {
+    if !fuse_available() {
+        return;
+    }
+    let big = random_bytes(21, 48 << 20);
+    for delay_ms in [30, 150, 600] {
+        let env = Env::new();
+        repo_with_main(&env);
+        let mnt = env.work.join("mnt");
+        fs::create_dir(&mnt).unwrap();
+        env.ok(&["mount", "main", &env.path("mnt")]);
+        fs::write(mnt.join("new.bin"), &big).unwrap();
+        let pid = mount_pid(&env);
+        let mut commit = Command::new(env!("CARGO_BIN_EXE_ctm"));
+        commit
+            .args(["commit", &env.path("mnt")])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("HOME", &env.home)
+            .env("XDG_CONFIG_HOME", env.home.join(".config"))
+            .env("XDG_DATA_HOME", env.home.join(".local/share"))
+            .env("XDG_RUNTIME_DIR", env.home.join("run"));
+        let mut child = commit.spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        kill_9(pid);
+        let _ = child.wait();
+
+        env.ok(&["mount", "main", &env.path("mnt")]);
+        let out = env.ok(&["commit", &env.path("mnt")]);
+        assert!(
+            out.starts_with("Committed") || out.starts_with("Nothing to commit"),
+            "after {delay_ms} ms: {out}"
+        );
+        assert_eq!(
+            env.ok(&["branch", "list"]).trim(),
+            "main",
+            "after {delay_ms} ms"
+        );
+        assert_eq!(
+            fs::metadata(mnt.join("new.bin")).unwrap().len(),
+            big.len() as u64
+        );
+        env.ok(&["unmount", &env.path("mnt")]);
+        assert!(
+            env.run(&["cat", "main:new.bin"]).stdout == big,
+            "after {delay_ms} ms"
+        );
+    }
+}
+
+#[test]
+fn appending_to_a_large_file_downloads_at_most_one_chunk() {
+    if !fuse_available() {
+        return;
+    }
+    let env = Env::new();
+    env.init();
+    let src = env.work.join("src");
+    fs::create_dir(&src).unwrap();
+    let mut data = random_bytes(31, 64 << 20);
+    fs::write(src.join("big.bin"), &data).unwrap();
+    env.ok(&["import", &env.path("src"), "--branch", "main"]);
+    let mnt = env.work.join("mnt");
+    fs::create_dir(&mnt).unwrap();
+    env.ok(&["mount", "main", &env.path("mnt")]);
+
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .open(mnt.join("big.bin"))
+        .unwrap();
+    assert_eq!(
+        cache(&env)["fetched_bytes"],
+        0,
+        "opening read-write downloads nothing"
+    );
+    std::io::Write::write_all(&mut f, b"!").unwrap();
+    drop(f);
+    env.ok(&["commit", &env.path("mnt")]);
+    let fetched = cache(&env)["fetched_bytes"].as_u64().unwrap();
+    assert!(
+        fetched <= 4 << 20,
+        "{fetched} bytes downloaded to append one"
+    );
+    env.ok(&["unmount", &env.path("mnt")]);
+    data.push(b'!');
+    assert!(env.run(&["cat", "main:big.bin"]).stdout == data);
+}

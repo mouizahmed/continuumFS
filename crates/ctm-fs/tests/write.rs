@@ -512,3 +512,95 @@ async fn restore_brings_back_a_path_from_a_ref() {
     state.commit("restored").await.unwrap();
     assert_eq!(export(&repo, "main").await["f"], b"original");
 }
+
+/// A backend whose branch-ref writes and reads can fail like a network outage. A failing
+/// write can still land first (only the answer is lost).
+#[derive(Default)]
+struct RefOutage {
+    inner: MemBackend,
+    fail_ref_puts: std::sync::atomic::AtomicBool,
+    land_failed_puts: std::sync::atomic::AtomicBool,
+    fail_ref_gets: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl Backend for RefOutage {
+    async fn get(&self, key: &str) -> ctm_store::Result<(bytes::Bytes, ctm_store::ETag)> {
+        if key.starts_with("refs/") && self.fail_ref_gets.load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ctm_store::Error::Backend("network down".into()));
+        }
+        self.inner.get(key).await
+    }
+    async fn head(&self, key: &str) -> ctm_store::Result<Option<ctm_store::ETag>> {
+        self.inner.head(key).await
+    }
+    async fn put(
+        &self,
+        key: &str,
+        body: bytes::Bytes,
+        mode: ctm_store::PutMode,
+    ) -> ctm_store::Result<ctm_store::ETag> {
+        use std::sync::atomic::Ordering::SeqCst;
+        if key.starts_with("refs/branches/") && self.fail_ref_puts.load(SeqCst) {
+            if self.land_failed_puts.load(SeqCst) {
+                let _ = self.inner.put(key, body, mode).await;
+            }
+            return Err(ctm_store::Error::Backend("network down".into()));
+        }
+        self.inner.put(key, body, mode).await
+    }
+    async fn list(&self, prefix: &str) -> ctm_store::Result<Vec<String>> {
+        self.inner.list(prefix).await
+    }
+    async fn delete(&self, key: &str) -> ctm_store::Result<()> {
+        self.inner.delete(key).await
+    }
+}
+
+/// When a commit's ref update fails and the ref can't be read either, the running mount
+/// refuses writes (reads still work) until the next commit settles what happened.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_commit_outcome_blocks_writes_until_the_next_commit() {
+    use std::sync::atomic::Ordering::SeqCst;
+    for lands in [false, true] {
+        let backend = Arc::new(RefOutage::default());
+        let repo = repo_with(backend.clone(), &[("f", b"base".to_vec())]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let state = open(&repo, dir.path(), "main", false).await;
+        write_file(&state, "f", b"edited").await;
+
+        backend.fail_ref_puts.store(true, SeqCst);
+        backend.land_failed_puts.store(lands, SeqCst);
+        backend.fail_ref_gets.store(true, SeqCst);
+        assert!(state.commit("lost").await.is_err());
+        let f = lookup_path(&state, "f").await.unwrap();
+        assert_eq!(read_all(&state, f).await, b"edited", "reads keep working");
+        let fh = state.open_file(f, true).await.unwrap();
+        assert_eq!(
+            state.write(fh, f, 0, b"x").await,
+            Err(Errno::EIO),
+            "lands: {lands}"
+        );
+        assert_eq!(state.mkdir(1, b"d", 0o755).await.err(), Some(Errno::EIO));
+
+        // The network is back: the next commit finds out and unblocks writes.
+        backend.fail_ref_puts.store(false, SeqCst);
+        backend.fail_ref_gets.store(false, SeqCst);
+        let outcome = state.commit("retry").await.unwrap();
+        assert!(
+            matches!(outcome, CommitOutcome::Pushed { .. }),
+            "lands: {lands}: {outcome:?}"
+        );
+        assert_eq!(export(&repo, "main").await["f"], b"edited");
+        state.write(fh, f, 0, b"E").await.unwrap();
+        state.release(fh).await.unwrap();
+        state.commit("after").await.unwrap();
+        assert_eq!(export(&repo, "main").await["f"], b"Edited");
+        assert_eq!(
+            repo.list_branches().await.unwrap().len(),
+            1,
+            "lands: {lands}"
+        );
+    }
+}
