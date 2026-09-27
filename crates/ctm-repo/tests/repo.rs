@@ -589,3 +589,39 @@ async fn import_skips_special_files_and_counts_them() {
         .collect();
     assert_eq!(names, [b"keep".to_vec()]);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn files_sharing_chunks_upload_them_once() {
+    // Two identical 6 MiB files are imported concurrently: each chunk is PUT once.
+    let src = tempfile::tempdir().unwrap();
+    let data = random_bytes(4, 6 << 20);
+    fs::write(src.path().join("a.bin"), &data).unwrap();
+    fs::write(src.path().join("b.bin"), &data).unwrap();
+    // With network-like latency, both files' uploads of a chunk overlap.
+    let be = Arc::new(FaultyBackend::new(
+        MemBackend::new(),
+        Faults {
+            latency: std::time::Duration::from_millis(20),
+            ..Faults::default()
+        },
+    ));
+    let repo = repo_on(be.clone()).await;
+    let imported = repo.import(src.path(), &name("main"), "").await.unwrap();
+    let chunks = be.inner().list("chunks/").await.unwrap().len();
+    let chunk_bytes: u64 = futures_len(be.inner(), "chunks/").await;
+    assert!(chunks >= 2);
+    // Chunks once, plus the page, list, tree, commit, and log segment.
+    assert!(
+        imported.uploaded.bytes < chunk_bytes + 64 * 1024,
+        "{:?}",
+        imported.uploaded
+    );
+}
+
+async fn futures_len(be: &MemBackend, prefix: &str) -> u64 {
+    let mut total = 0;
+    for key in be.list(prefix).await.unwrap() {
+        total += be.get(&key).await.unwrap().0.len() as u64;
+    }
+    total
+}

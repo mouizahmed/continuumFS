@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -120,6 +120,8 @@ pub struct Repo {
     identity: Identity,
     /// Objects known to be stored, so uploads skip them without a HEAD.
     known: Mutex<HashSet<Id>>,
+    /// Uploads in flight: a second upload of the same object waits for the first.
+    uploading: Mutex<HashMap<Id, Arc<tokio::sync::OnceCell<()>>>>,
     requests: tokio::sync::Semaphore,
     uploaded_objects: AtomicU64,
     uploaded_bytes: AtomicU64,
@@ -189,6 +191,7 @@ impl Repo {
             backend,
             identity,
             known: Mutex::new(HashSet::new()),
+            uploading: Mutex::new(HashMap::new()),
             requests: tokio::sync::Semaphore::new(CONCURRENCY),
             uploaded_objects: AtomicU64::new(0),
             uploaded_bytes: AtomicU64::new(0),
@@ -336,6 +339,25 @@ impl Repo {
         if self.known.lock().unwrap().contains(&obj.id) {
             return Ok(());
         }
+        // One upload per object at a time (two files often share chunks). If it fails, a
+        // waiting caller tries again itself.
+        let cell = self
+            .uploading
+            .lock()
+            .unwrap()
+            .entry(obj.id)
+            .or_default()
+            .clone();
+        let result = cell.get_or_try_init(|| self.upload(&obj)).await.map(|_| ());
+        self.uploading.lock().unwrap().remove(&obj.id);
+        if result.is_ok() {
+            self.known.lock().unwrap().insert(obj.id);
+        }
+        result
+    }
+
+    /// HEAD, then PUT if the object isn't stored yet.
+    async fn upload(&self, obj: &Encoded) -> Result<()> {
         let key = object_key(obj.ty, &obj.id);
         let _permit = self.requests.acquire().await.expect("never closed");
         if self.backend.head(&key).await?.is_none() {
@@ -347,7 +369,6 @@ impl Repo {
             self.uploaded_objects.fetch_add(1, Ordering::Relaxed);
             self.uploaded_bytes.fetch_add(len, Ordering::Relaxed);
         }
-        self.known.lock().unwrap().insert(obj.id);
         Ok(())
     }
 
