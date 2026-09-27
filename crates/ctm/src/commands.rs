@@ -64,9 +64,11 @@ pub async fn import(dir: &Path, branch: &str, message: &str) -> Result<()> {
         );
     }
     println!(
-        "Imported {} → {branch} (commit {})",
+        "Imported {} → {branch} (commit {}; uploaded {} objects, {})",
         dir.display(),
-        short(&imported.commit)
+        short(&imported.commit),
+        imported.uploaded.objects,
+        crate::mount::human(imported.uploaded.bytes)
     );
     Ok(())
 }

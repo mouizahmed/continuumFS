@@ -4,6 +4,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -25,10 +26,12 @@ use crate::refspec::{RefSpec, RefTarget};
 use crate::time::{now_ns, rfc3339};
 use crate::{Error, RepoConfig, Result};
 
-/// Requests in flight per operation.
+/// Requests in flight per repo, shared by every operation.
 const CONCURRENCY: usize = 64;
-/// Chunks read ahead of their uploads while importing a file (at most ~64 MiB of memory).
-const IMPORT_BATCH: usize = 16;
+/// Files imported at once, and chunks each reads ahead of its uploads: at most
+/// 16 × 4 × 4 MiB = 256 MiB in memory.
+const IMPORT_FILES: usize = 16;
+const IMPORT_BATCH: usize = 4;
 
 /// Who is writing: recorded in commits and refs.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -81,6 +84,24 @@ pub struct Imported {
     pub commit: Id,
     /// FIFOs, sockets, and device nodes, which are skipped with a warning each.
     pub skipped: usize,
+    pub uploaded: Uploaded,
+}
+
+/// Objects and bytes this repo handle has PUT (objects already stored are skipped).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Uploaded {
+    pub objects: u64,
+    pub bytes: u64,
+}
+
+impl std::ops::Sub for Uploaded {
+    type Output = Uploaded;
+    fn sub(self, before: Uploaded) -> Uploaded {
+        Uploaded {
+            objects: self.objects - before.objects,
+            bytes: self.bytes - before.bytes,
+        }
+    }
 }
 
 /// One changed path in a diff.
@@ -99,6 +120,9 @@ pub struct Repo {
     identity: Identity,
     /// Objects known to be stored, so uploads skip them without a HEAD.
     known: Mutex<HashSet<Id>>,
+    requests: tokio::sync::Semaphore,
+    uploaded_objects: AtomicU64,
+    uploaded_bytes: AtomicU64,
 }
 
 /// Where an object is stored: `chunks/<id>` for chunks, `meta/<id>` for everything else.
@@ -165,6 +189,9 @@ impl Repo {
             backend,
             identity,
             known: Mutex::new(HashSet::new()),
+            requests: tokio::sync::Semaphore::new(CONCURRENCY),
+            uploaded_objects: AtomicU64::new(0),
+            uploaded_bytes: AtomicU64::new(0),
         })
     }
 
@@ -267,12 +294,23 @@ impl Repo {
 
     // Objects
 
+    /// Everything this handle has uploaded so far.
+    pub fn uploaded(&self) -> Uploaded {
+        Uploaded {
+            objects: self.uploaded_objects.load(Ordering::Relaxed),
+            bytes: self.uploaded_bytes.load(Ordering::Relaxed),
+        }
+    }
+
     /// Fetches, hash-verifies, and decodes an object. A hash mismatch is retried once.
     pub async fn get<T: Object>(&self, id: &Id) -> Result<T> {
         let key = object_key(T::TYPE, id);
         let mut retried = false;
         loop {
-            let (bytes, _) = self.backend.get(&key).await?;
+            let (bytes, _) = {
+                let _permit = self.requests.acquire().await.expect("never closed");
+                self.backend.get(&key).await?
+            };
             match decode_verified::<T>(&self.key, id, &bytes, &self.params) {
                 Ok(obj) => {
                     self.known.lock().unwrap().insert(*id);
@@ -299,10 +337,15 @@ impl Repo {
             return Ok(());
         }
         let key = object_key(obj.ty, &obj.id);
+        let _permit = self.requests.acquire().await.expect("never closed");
         if self.backend.head(&key).await?.is_none() {
+            let stored = obj.to_stored();
+            let len = stored.len() as u64;
             self.backend
-                .put(&key, Bytes::from(obj.to_stored()), PutMode::Overwrite)
+                .put(&key, Bytes::from(stored), PutMode::Overwrite)
                 .await?;
+            self.uploaded_objects.fetch_add(1, Ordering::Relaxed);
+            self.uploaded_bytes.fetch_add(len, Ordering::Relaxed);
         }
         self.known.lock().unwrap().insert(obj.id);
         Ok(())
@@ -622,8 +665,11 @@ impl Repo {
 
     /// Commits a local directory to a branch (created if missing, CAS otherwise).
     pub async fn import(&self, dir: &Path, branch: &BranchName, message: &str) -> Result<Imported> {
-        let mut skipped = 0;
-        let root = self.import_dir(dir, &mut skipped).await?;
+        let before = self.uploaded();
+        let skipped = AtomicUsize::new(0);
+        let slots = tokio::sync::Semaphore::new(IMPORT_FILES);
+        let root = self.import_dir(dir, &skipped, &slots).await?;
+        let skipped = skipped.into_inner();
         let commit = Commit {
             root_tree: root,
             time_ns: now_ns(),
@@ -655,53 +701,75 @@ impl Repo {
         Ok(Imported {
             commit: id,
             skipped,
+            uploaded: self.uploaded() - before,
         })
     }
 
-    async fn import_dir(&self, dir: &Path, skipped: &mut usize) -> Result<Id> {
+    /// Imports a directory: its entries are imported concurrently (files hold one of `slots`
+    /// while they're read and uploaded), then its tree is uploaded.
+    async fn import_dir(
+        &self,
+        dir: &Path,
+        skipped: &AtomicUsize,
+        slots: &tokio::sync::Semaphore,
+    ) -> Result<Id> {
         let mut children: Vec<_> = fs::read_dir(dir)?.collect::<io::Result<_>>()?;
         children.sort_by(|a, b| a.file_name().as_bytes().cmp(b.file_name().as_bytes()));
-        let mut entries = Vec::with_capacity(children.len());
-        for child in children {
-            let path = child.path();
-            let meta = fs::symlink_metadata(&path)?;
-            let ft = meta.file_type();
-            let mtime_ns = meta.mtime() * 1_000_000_000 + meta.mtime_nsec();
-            let (content, size, mode) = if ft.is_symlink() {
-                let target = fs::read_link(&path)?.into_os_string().into_encoded_bytes();
-                if target.len() > 4095 {
-                    return Err(Error::Io(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("{}: symlink target too long", path.display()),
-                    )));
-                }
-                let size = target.len() as u64;
-                (Content::Symlink(target), size, 0o777)
-            } else if ft.is_dir() {
-                let tree = Box::pin(self.import_dir(&path, skipped)).await?;
-                (Content::Dir(tree), 0, perm(&meta))
-            } else if ft.is_file() {
-                let (content, size) = self.import_file(&path).await?;
-                (content, size, perm(&meta))
-            } else {
-                tracing::warn!(
-                    "skipped {} (not a file, directory, or symlink)",
-                    path.display()
-                );
-                *skipped += 1;
-                continue;
-            };
-            entries.push(DirEntry {
-                name: child.file_name().as_bytes().to_vec(),
-                mode,
-                mtime_ns,
-                size,
-                content,
-                btime_ns: None,
-                xattrs: None,
-            });
-        }
-        self.put(&Tree { entries }).await
+        let entries: Vec<Option<DirEntry>> = stream::iter(children)
+            .map(|child| self.import_entry(child, skipped, slots))
+            .buffered(IMPORT_FILES)
+            .try_collect()
+            .await?;
+        self.put(&Tree {
+            entries: entries.into_iter().flatten().collect(),
+        })
+        .await
+    }
+
+    async fn import_entry(
+        &self,
+        child: fs::DirEntry,
+        skipped: &AtomicUsize,
+        slots: &tokio::sync::Semaphore,
+    ) -> Result<Option<DirEntry>> {
+        let path = child.path();
+        let meta = fs::symlink_metadata(&path)?;
+        let ft = meta.file_type();
+        let mtime_ns = meta.mtime() * 1_000_000_000 + meta.mtime_nsec();
+        let (content, size, mode) = if ft.is_symlink() {
+            let target = fs::read_link(&path)?.into_os_string().into_encoded_bytes();
+            if target.len() > 4095 {
+                return Err(Error::Io(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{}: symlink target too long", path.display()),
+                )));
+            }
+            let size = target.len() as u64;
+            (Content::Symlink(target), size, 0o777)
+        } else if ft.is_dir() {
+            let tree = Box::pin(self.import_dir(&path, skipped, slots)).await?;
+            (Content::Dir(tree), 0, perm(&meta))
+        } else if ft.is_file() {
+            let _slot = slots.acquire().await.expect("never closed");
+            let (content, size) = self.import_file(&path).await?;
+            (content, size, perm(&meta))
+        } else {
+            tracing::warn!(
+                "skipped {} (not a file, directory, or symlink)",
+                path.display()
+            );
+            skipped.fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        };
+        Ok(Some(DirEntry {
+            name: child.file_name().as_bytes().to_vec(),
+            mode,
+            mtime_ns,
+            size,
+            content,
+            btime_ns: None,
+            xattrs: None,
+        }))
     }
 
     async fn import_file(&self, path: &Path) -> Result<(Content, u64)> {

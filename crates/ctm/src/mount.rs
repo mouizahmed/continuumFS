@@ -352,9 +352,13 @@ fn error(message: impl std::fmt::Display) -> Response {
 
 /// Commits, and follows an auto-fork in `mount.json`.
 async fn commit(state: &MountState, record: &mut MountRecord, message: &str) -> Response {
-    match state.commit(message).await {
+    let before = state.repo().uploaded();
+    let result = state.commit(message).await;
+    let up = state.repo().uploaded() - before;
+    let uploaded = format!("uploaded {} objects, {}", up.objects, human(up.bytes));
+    match result {
         Ok(CommitOutcome::Pushed { commit }) => ok(format!(
-            "Committed {} to {}",
+            "Committed {} to {} ({uploaded})",
             &commit.to_hex()[..12],
             record.spec
         )),
@@ -364,7 +368,7 @@ async fn commit(state: &MountState, record: &mut MountRecord, message: &str) -> 
                 tracing::warn!("updating mount.json: {e}");
             }
             ok(format!(
-                "{from} moved on another machine. Your changes are safe on {branch}."
+                "{from} moved on another machine. Your changes are safe on {branch}. ({uploaded})"
             ))
         }
         Ok(CommitOutcome::NothingToCommit) => ok("Nothing to commit".into()),
@@ -430,7 +434,16 @@ async fn handle(
                     false,
                 );
             }
-            match fusermount(&record.mountpoint, false) {
+            // The kernel can report a mount busy for a moment after its last file closes.
+            let mut result = fusermount(&record.mountpoint, false);
+            for _ in 0..10 {
+                if result.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                result = fusermount(&record.mountpoint, false);
+            }
+            match result {
                 Ok(()) => (
                     ok(format!("Unmounted {}", record.mountpoint.display())),
                     true,
@@ -607,7 +620,7 @@ pub async fn cache_stats(json: bool) -> Result<()> {
     Ok(())
 }
 
-fn human(bytes: u64) -> String {
+pub(crate) fn human(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = bytes as f64;
     let mut unit = 0;

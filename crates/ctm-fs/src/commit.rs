@@ -11,6 +11,7 @@ use std::io;
 use std::ops::Range;
 use std::path::Path;
 
+use futures::{StreamExt, TryStreamExt};
 use rusqlite::Transaction;
 
 use ctm_core::layout::paginate;
@@ -27,8 +28,10 @@ use crate::inode::ROOT;
 use crate::state::{Base, FileView, MountState, Unresolved, now_ns};
 use crate::{CommitOutcome, Errno, Error, Result};
 
-/// Chunks uploaded per batch while committing a file (at most ~64 MiB in memory).
-const UPLOAD_BATCH: usize = 16;
+/// Files committed at once, and chunks each holds before uploading them: at most
+/// 16 × 4 × 4 MiB = 256 MiB in memory.
+const COMMIT_FILES: usize = 16;
+const UPLOAD_BATCH: usize = 4;
 /// Auto-fork names tried: `<branch>.<host>`, then `-2` … up to this.
 const FORK_ATTEMPTS: u32 = 100;
 
@@ -46,6 +49,14 @@ pub(crate) struct Prepared {
     new_ref: BranchRef,
     target: BranchName,
     forked_from: Option<BranchName>,
+}
+
+/// What building the trees produces, gathered from concurrent tasks.
+#[derive(Default)]
+struct Built {
+    files: HashMap<u64, DirEntry>,
+    dirty: Vec<u64>,
+    dirs: HashMap<u64, Id>,
 }
 
 /// A changed node, as of the start of the commit.
@@ -257,7 +268,13 @@ impl MountState {
             target: branch.clone(),
             forked_from: None,
         };
-        prepared.root = self.build_tree(&snap, ROOT, &mut prepared).await?;
+        let built = std::sync::Mutex::new(Built::default());
+        let slots = tokio::sync::Semaphore::new(COMMIT_FILES);
+        prepared.root = self.build_tree(&snap, ROOT, &built, &slots).await?;
+        let built = built.into_inner().unwrap();
+        prepared.files = built.files;
+        prepared.dirty = built.dirty;
+        prepared.dirs = built.dirs;
         let identity = self.repo.identity();
         let commit = Commit {
             root_tree: prepared.root,
@@ -447,8 +464,16 @@ impl MountState {
         }
     }
 
-    /// Builds and uploads a changed directory's tree, children first.
-    async fn build_tree(&self, snap: &Snapshot, dir: u64, p: &mut Prepared) -> Result<Id> {
+    /// Builds and uploads a changed directory's tree. Changed children are built
+    /// concurrently (dirty files each hold one of `slots`), and all of them are uploaded
+    /// before the tree that references them.
+    async fn build_tree(
+        &self,
+        snap: &Snapshot,
+        dir: u64,
+        built: &std::sync::Mutex<Built>,
+        slots: &tokio::sync::Semaphore,
+    ) -> Result<Id> {
         let node = &snap.nodes[&dir];
         let Content::Dir(base_tree) = node.entry.content else {
             unreachable!("directories hold a tree");
@@ -460,35 +485,47 @@ impl MountState {
             .filter(|e| !snap.whiteouts.contains(&(dir, e.name.clone())))
             .map(|e| (e.name.clone(), e.clone()))
             .collect();
-        for (name, child) in snap.children.get(&dir).into_iter().flatten() {
-            let c = &snap.nodes[child];
-            let entry = match c.entry.content.kind() {
-                Kind::Dir => {
-                    let tree = Box::pin(self.build_tree(snap, *child, p)).await?;
-                    DirEntry {
-                        content: Content::Dir(tree),
-                        size: 0,
-                        ..c.entry.clone()
+        let children = snap
+            .children
+            .get(&dir)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let changed: Vec<(Vec<u8>, DirEntry)> = futures::stream::iter(children)
+            .map(|(name, child)| async move {
+                let c = &snap.nodes[child];
+                let entry = match c.entry.content.kind() {
+                    Kind::Dir => {
+                        let tree = Box::pin(self.build_tree(snap, *child, built, slots)).await?;
+                        DirEntry {
+                            content: Content::Dir(tree),
+                            size: 0,
+                            ..c.entry.clone()
+                        }
                     }
+                    Kind::File if c.dirty => {
+                        let _slot = slots.acquire().await.expect("never closed");
+                        let entry = self.commit_file(c, *child).await?;
+                        built.lock().unwrap().dirty.push(*child);
+                        entry
+                    }
+                    _ => c.entry.clone(),
+                };
+                if entry.content.kind() != Kind::Dir {
+                    built.lock().unwrap().files.insert(*child, entry.clone());
                 }
-                Kind::File if c.dirty => {
-                    p.dirty.push(*child);
-                    self.commit_file(c, *child).await?
-                }
-                _ => c.entry.clone(),
-            };
-            if entry.content.kind() != Kind::Dir {
-                p.files.insert(*child, entry.clone());
-            }
-            entries.insert(name.clone(), entry);
-        }
+                Ok::<_, Error>((name.clone(), entry))
+            })
+            .buffer_unordered(COMMIT_FILES)
+            .try_collect()
+            .await?;
+        entries.extend(changed);
         let tree = Tree {
             entries: entries.into_values().collect(),
         };
         let enc = Encoded::new(self.repo.key(), &tree);
         let id = enc.id;
         self.repo.put_objects(vec![enc]).await?;
-        p.dirs.insert(dir, id);
+        built.lock().unwrap().dirs.insert(dir, id);
         Ok(id)
     }
 

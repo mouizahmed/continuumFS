@@ -12,7 +12,7 @@ pub use check::check;
 pub use config::RepoConfig;
 pub use refs::{BranchName, BranchRef, ForkedFrom, SnapshotRef};
 pub use refspec::RefSpec;
-pub use repo::{Identity, Imported, InitOutcome, PathChange, Repo, Resolved, object_key};
+pub use repo::{Identity, Imported, InitOutcome, PathChange, Repo, Resolved, Uploaded, object_key};
 pub use time::rfc3339;
 
 #[derive(Debug, thiserror::Error)]
