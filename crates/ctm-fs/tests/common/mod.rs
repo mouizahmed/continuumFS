@@ -8,11 +8,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use ctm_core::pack::{Location, read_trailer};
 use ctm_fs::{Errno, Fh, MountOptions, MountState};
 use ctm_repo::{Identity, Repo};
 use ctm_store::{Backend, ETag, MemBackend, PutMode};
 
-/// Counts GETs of chunks and metadata objects.
+/// Counts reads of chunks and metadata objects (ranged GETs of data and meta packs).
 #[derive(Default)]
 pub struct Counting {
     pub inner: MemBackend,
@@ -29,17 +30,51 @@ impl Counting {
     pub fn chunk_gets(&self) -> usize {
         self.chunk_gets.load(Ordering::SeqCst)
     }
+
+    fn count(&self, key: &str) {
+        if key.starts_with("packs/data/") {
+            self.chunk_gets.fetch_add(1, Ordering::SeqCst);
+        } else if key.starts_with("packs/meta/") {
+            self.meta_gets.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Every chunk stored in `backend`'s data packs, with where it is.
+pub async fn packed_chunks(backend: &dyn Backend) -> Vec<(String, Location)> {
+    let mut out = Vec::new();
+    for key in backend.list("packs/data/").await.unwrap() {
+        let (pack, _) = backend.get(&key).await.unwrap();
+        let (_, entries) = read_trailer(&pack).unwrap();
+        out.extend(entries.into_iter().map(|(_, loc)| (key.clone(), loc)));
+    }
+    out
+}
+
+/// Flips the last payload byte of every packed chunk.
+pub async fn corrupt_chunks(backend: &dyn Backend) {
+    for key in backend.list("packs/data/").await.unwrap() {
+        let (pack, _) = backend.get(&key).await.unwrap();
+        let mut pack = pack.to_vec();
+        for (_, loc) in read_trailer(&pack).unwrap().1 {
+            pack[loc.range().end as usize - 1] ^= 1;
+        }
+        backend
+            .put(&key, pack.into(), PutMode::Overwrite)
+            .await
+            .unwrap();
+    }
 }
 
 #[async_trait]
 impl Backend for Counting {
     async fn get(&self, key: &str) -> ctm_store::Result<(Bytes, ETag)> {
-        if key.starts_with("chunks/") {
-            self.chunk_gets.fetch_add(1, Ordering::SeqCst);
-        } else if key.starts_with("meta/") {
-            self.meta_gets.fetch_add(1, Ordering::SeqCst);
-        }
+        self.count(key);
         self.inner.get(key).await
+    }
+    async fn get_range(&self, key: &str, range: std::ops::Range<u64>) -> ctm_store::Result<Bytes> {
+        self.count(key);
+        self.inner.get_range(key, range).await
     }
     async fn head(&self, key: &str) -> ctm_store::Result<Option<ETag>> {
         self.inner.head(key).await

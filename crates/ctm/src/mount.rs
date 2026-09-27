@@ -13,10 +13,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
 use ctm_fs::{CommitOutcome, MountOptions, MountState, fuse};
-use ctm_repo::{RefSpec, Repo, refspec::RefTarget};
+use ctm_repo::{RefSpec, refspec::RefTarget};
 
 use crate::Result;
-use crate::commands::{identity, load_config};
+use crate::commands::{identity, load_config, open_at};
 use crate::config::RepoEntry;
 use crate::control::{self, Request, Response};
 use crate::paths;
@@ -174,7 +174,7 @@ pub async fn mount(spec: &str, dir: &Path, read_only: bool, foreground: bool) ->
     let read_only = read_only || !is_branch;
     let mountpoint = absolute(dir)?;
     let backend = ctm_store::open(&entry.url, entry.endpoint.as_deref())?;
-    let repo = Repo::open(backend, identity(&config)?).await?;
+    let repo = open_at(backend, identity(&config)?).await?;
     let repo_id = repo.config().repo_id.clone();
 
     // A mount of this directory left behind by a crash, `--no-commit`, or a failed commit.
@@ -261,7 +261,7 @@ pub async fn run(state_dir: PathBuf) -> Result<()> {
     record.save()?;
     let config = load_config()?;
     let backend = ctm_store::open(&record.repo.url, record.repo.endpoint.as_deref())?;
-    let repo = Arc::new(Repo::open(backend, identity(&config)?).await?);
+    let repo = Arc::new(open_at(backend, identity(&config)?).await?);
     let opts = MountOptions {
         read_only: record.read_only,
         chunk_cache_max: parse_size(&config.cache.chunks_max)?,
@@ -587,7 +587,7 @@ pub async fn unmount(dir: &Path, no_commit: bool) -> Result<()> {
 pub async fn cache_stats(json: bool) -> Result<()> {
     let config = load_config()?;
     let (_, entry) = config.default_repo()?;
-    let repo = Repo::open(
+    let repo = open_at(
         ctm_store::open(&entry.url, entry.endpoint.as_deref())?,
         identity(&config)?,
     )

@@ -218,6 +218,7 @@ struct Counting {
     heads: AtomicUsize,
     puts: AtomicUsize,
     lists: AtomicUsize,
+    got: std::sync::Mutex<Vec<String>>,
 }
 
 impl Counting {
@@ -225,6 +226,12 @@ impl Counting {
         for c in [&self.gets, &self.heads, &self.puts, &self.lists] {
             c.store(0, Ordering::SeqCst);
         }
+        self.got.lock().unwrap().clear();
+    }
+    /// Keys read so far that start with `prefix`.
+    fn got(&self, prefix: &str) -> usize {
+        let got = self.got.lock().unwrap();
+        got.iter().filter(|k| k.starts_with(prefix)).count()
     }
     fn counts(&self) -> [usize; 4] {
         [&self.gets, &self.heads, &self.puts, &self.lists].map(|c| c.load(Ordering::SeqCst))
@@ -235,6 +242,7 @@ impl Counting {
 impl Backend for Counting {
     async fn get(&self, key: &str) -> ctm_store::Result<(Bytes, ETag)> {
         self.gets.fetch_add(1, Ordering::SeqCst);
+        self.got.lock().unwrap().push(key.to_string());
         self.inner.get(key).await
     }
     async fn head(&self, key: &str) -> ctm_store::Result<Option<ETag>> {
@@ -449,11 +457,14 @@ async fn reimport_uploads_no_new_chunks() {
     let be = Arc::new(Counting::default());
     let repo = repo_on(be.clone()).await;
     repo.import(src.path(), &name("main"), "").await.unwrap();
-    let chunks_before = be.inner.list("chunks/").await.unwrap().len();
+    let packs_before = be.inner.list("packs/data/").await.unwrap().len();
     be.reset();
     repo.import(src.path(), &name("main"), "").await.unwrap();
-    assert_eq!(be.inner.list("chunks/").await.unwrap().len(), chunks_before);
-    // Only the commit, the log segment, and the ref are new.
+    assert_eq!(
+        be.inner.list("packs/data/").await.unwrap().len(),
+        packs_before
+    );
+    // Only the commit and log segment are new: one meta pack, its index segment, and the ref.
     assert_eq!(be.counts()[2], 3, "puts");
 }
 
@@ -513,10 +524,14 @@ async fn check_passes_and_catches_missing_objects() {
     sample_tree(src.path());
     repo.import(src.path(), &name("main"), "").await.unwrap();
     assert_eq!(ctm_repo::check(&repo).await.unwrap(), Vec::<String>::new());
-    let victim = be.list("chunks/").await.unwrap().remove(0);
+    let victim = be.list("packs/data/").await.unwrap().remove(0);
     be.delete(&victim).await.unwrap();
     let problems = ctm_repo::check(&repo).await.unwrap();
-    assert_eq!(problems.len(), 1, "{problems:?}");
+    assert!(!problems.is_empty());
+    assert!(
+        problems.iter().all(|p| p.starts_with("chunk ")),
+        "{problems:?}"
+    );
 }
 
 /// A crash at any point during an import leaves a consistent repo: the branch is at the old
@@ -564,7 +579,8 @@ async fn a_crash_at_any_put_leaves_the_repo_consistent() {
         }
         n += 1;
     }
-    assert!(n > 5, "the import should take several puts");
+    // A data pack, a meta pack, an index segment, and the ref.
+    assert_eq!(n, 4, "puts per import");
 }
 
 #[tokio::test]
@@ -607,12 +623,12 @@ async fn files_sharing_chunks_upload_them_once() {
     ));
     let repo = repo_on(be.clone()).await;
     let imported = repo.import(src.path(), &name("main"), "").await.unwrap();
-    let chunks = be.inner().list("chunks/").await.unwrap().len();
-    let chunk_bytes: u64 = futures_len(be.inner(), "chunks/").await;
-    assert!(chunks >= 2);
-    // Chunks once, plus the page, list, tree, commit, and log segment.
+    let data_packs: u64 = futures_len(be.inner(), "packs/data/").await;
+    // Each chunk once (6 MiB plus pack framing), plus the page, list, tree, commit, and log
+    // segment.
+    assert!(data_packs < (6 << 20) + 4096, "{data_packs}");
     assert!(
-        imported.uploaded.bytes < chunk_bytes + 64 * 1024,
+        imported.uploaded.bytes < data_packs + 64 * 1024,
         "{:?}",
         imported.uploaded
     );
@@ -757,4 +773,94 @@ async fn a_version_1_repo_is_read_and_upgraded_on_first_write() {
         ctm_repo::check(&reopened).await.unwrap(),
         Vec::<String>::new()
     );
+}
+
+#[tokio::test]
+async fn another_handle_finds_packed_objects_through_the_index() {
+    // 40 MiB of chunks fills more than one 32 MiB data pack.
+    let src = tempfile::tempdir().unwrap();
+    sample_tree(src.path());
+    fs::write(src.path().join("large.bin"), random_bytes(5, 40 << 20)).unwrap();
+    let be: Arc<dyn Backend> = Arc::new(MemBackend::new());
+    let writer = repo_on(be.clone()).await;
+    let imported = writer.import(src.path(), &name("main"), "").await.unwrap();
+    assert_eq!(be.list("packs/data/").await.unwrap().len(), 2);
+    assert_eq!(be.list("packs/meta/").await.unwrap().len(), 1);
+    assert_eq!(be.list("index/").await.unwrap().len(), 1);
+    assert!(be.list("chunks/").await.unwrap().is_empty());
+    assert!(be.list("meta/").await.unwrap().is_empty());
+
+    // A fresh handle (another machine) syncs the index on its first miss.
+    let reader = Repo::open(be.clone(), identity()).await.unwrap();
+    let out = tempfile::tempdir().unwrap();
+    reader
+        .export(&spec("main"), &out.path().join("x"))
+        .await
+        .unwrap();
+    assert_eq!(snapshot(&out.path().join("x")), snapshot(src.path()));
+    let prefix = &imported.commit.to_hex()[..12];
+    assert_eq!(
+        reader.resolve(&spec(prefix)).await.unwrap().commit,
+        imported.commit
+    );
+}
+
+#[tokio::test]
+async fn the_index_mirror_persists_between_opens() {
+    let src = tempfile::tempdir().unwrap();
+    sample_tree(src.path());
+    let be = Arc::new(Counting::default());
+    repo_on(be.clone())
+        .await
+        .import(src.path(), &name("main"), "")
+        .await
+        .unwrap();
+    let cache = tempfile::tempdir().unwrap();
+    let db = cache.path().join("index.db");
+    let open = || async {
+        Repo::open(be.clone(), identity())
+            .await
+            .unwrap()
+            .with_index_at(&db)
+            .unwrap()
+    };
+    be.reset();
+    open().await.ls(&spec("main")).await.unwrap();
+    assert_eq!(be.got("index/"), 1);
+    be.reset();
+    open().await.ls(&spec("main")).await.unwrap();
+    assert_eq!(be.got("index/"), 0);
+}
+
+#[tokio::test]
+async fn a_second_import_on_another_handle_skips_stored_chunks() {
+    let src = tempfile::tempdir().unwrap();
+    fs::write(src.path().join("big"), random_bytes(9, 5 << 20)).unwrap();
+    let be: Arc<dyn Backend> = Arc::new(MemBackend::new());
+    repo_on(be.clone())
+        .await
+        .import(src.path(), &name("main"), "")
+        .await
+        .unwrap();
+    let other = Repo::open(be.clone(), identity()).await.unwrap();
+    other.import(src.path(), &name("copy"), "").await.unwrap();
+    assert_eq!(be.list("packs/data/").await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn loose_objects_from_before_packs_are_still_read() {
+    use ctm_core::{Chunk, Encoded};
+    let be: Arc<dyn Backend> = Arc::new(MemBackend::new());
+    let repo = repo_on(be.clone()).await;
+    let chunk = Chunk(b"written by v0.1".to_vec());
+    let enc = Encoded::new(repo.key(), &chunk);
+    be.put(
+        &format!("chunks/{}", enc.id),
+        enc.to_stored().into(),
+        PutMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    let read: Chunk = repo.get(&enc.id).await.unwrap();
+    assert_eq!(read.0, chunk.0);
 }

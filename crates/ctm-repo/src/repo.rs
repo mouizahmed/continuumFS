@@ -1,11 +1,11 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
@@ -22,6 +22,7 @@ use ctm_core::{
 use ctm_store::{Backend, ETag, PutMode};
 
 use crate::config::FORMAT_VERSION;
+use crate::objects::{Objects, Uploaded};
 use crate::refs::{BranchName, BranchRef, ForkedFrom, SnapshotRef};
 use crate::refspec::{RefSpec, RefTarget};
 use crate::time::{now_ns, rfc3339};
@@ -88,23 +89,6 @@ pub struct Imported {
     pub uploaded: Uploaded,
 }
 
-/// Objects and bytes this repo handle has PUT (objects already stored are skipped).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Uploaded {
-    pub objects: u64,
-    pub bytes: u64,
-}
-
-impl std::ops::Sub for Uploaded {
-    type Output = Uploaded;
-    fn sub(self, before: Uploaded) -> Uploaded {
-        Uploaded {
-            objects: self.objects - before.objects,
-            bytes: self.bytes - before.bytes,
-        }
-    }
-}
-
 /// One changed path in a diff.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PathChange {
@@ -120,19 +104,7 @@ pub struct Repo {
     params: FormatParams,
     identity: Identity,
     format_version: AtomicU32,
-    /// Objects known to be stored, so uploads skip them without a HEAD.
-    known: Mutex<HashSet<Id>>,
-    /// Uploads in flight: a second upload of the same object waits for the first.
-    uploading: Mutex<HashMap<Id, Arc<tokio::sync::OnceCell<()>>>>,
-    requests: tokio::sync::Semaphore,
-    uploaded_objects: AtomicU64,
-    uploaded_bytes: AtomicU64,
-}
-
-/// Where an object is stored: `chunks/<id>` for chunks, `meta/<id>` for everything else.
-pub fn object_key(ty: ObjectType, id: &Id) -> String {
-    let dir = if ty.is_data() { "chunks" } else { "meta" };
-    format!("{dir}/{id}")
+    objects: Objects,
 }
 
 fn corrupt_json(what: &str, e: impl ToString) -> Error {
@@ -225,13 +197,9 @@ impl Repo {
             params: config.params(),
             format_version: AtomicU32::new(config.format_version),
             config,
+            objects: Objects::new(backend.clone(), None)?,
             backend,
             identity,
-            known: Mutex::new(HashSet::new()),
-            uploading: Mutex::new(HashMap::new()),
-            requests: tokio::sync::Semaphore::new(CONCURRENCY),
-            uploaded_objects: AtomicU64::new(0),
-            uploaded_bytes: AtomicU64::new(0),
         })
     }
 
@@ -271,6 +239,7 @@ impl Repo {
 
     /// Create-only (`If-None-Match: *`).
     pub async fn create_ref(&self, name: &BranchName, new: &BranchRef) -> Result<ETag> {
+        self.flush().await?;
         let body = serde_json::to_vec_pretty(new).expect("ref serializes");
         match self
             .backend
@@ -291,6 +260,7 @@ impl Repo {
         new: &BranchRef,
         expected: &ETag,
     ) -> Result<ETag> {
+        self.flush().await?;
         let body = serde_json::to_vec_pretty(new).expect("ref serializes");
         Ok(self
             .backend
@@ -336,24 +306,29 @@ impl Repo {
 
     /// Everything this handle has uploaded so far.
     pub fn uploaded(&self) -> Uploaded {
-        Uploaded {
-            objects: self.uploaded_objects.load(Ordering::Relaxed),
-            bytes: self.uploaded_bytes.load(Ordering::Relaxed),
-        }
+        self.objects.uploaded()
+    }
+
+    /// Keeps the index mirror in `path` (a SQLite file) instead of in memory, so later
+    /// processes start with it. Call right after opening.
+    pub fn with_index_at(mut self, path: &Path) -> Result<Repo> {
+        self.objects = Objects::new(self.backend.clone(), Some(path))?;
+        Ok(self)
+    }
+
+    /// An object in its stored form (`[type][flags][payload]`), not yet verified.
+    pub async fn read_stored(&self, ty: ObjectType, id: &Id) -> Result<Bytes> {
+        self.objects.read_stored(ty.is_data(), id).await
     }
 
     /// Fetches, hash-verifies, and decodes an object. A hash mismatch is retried once.
     pub async fn get<T: Object>(&self, id: &Id) -> Result<T> {
-        let key = object_key(T::TYPE, id);
         let mut retried = false;
         loop {
-            let (bytes, _) = {
-                let _permit = self.requests.acquire().await.expect("never closed");
-                self.backend.get(&key).await?
-            };
+            let bytes = self.read_stored(T::TYPE, id).await?;
             match decode_verified::<T>(&self.key, id, &bytes, &self.params) {
                 Ok(obj) => {
-                    self.known.lock().unwrap().insert(*id);
+                    self.objects.mark_known(*id);
                     return Ok(obj);
                 }
                 Err(VerifyError::HashMismatch { .. }) if !retried => retried = true,
@@ -362,51 +337,20 @@ impl Repo {
         }
     }
 
-    /// Uploads objects that aren't already stored (HEAD, then PUT if missing), concurrently.
-    /// Callers upload children before the objects that reference them.
+    /// Adds objects that aren't already stored to this handle's packs. They're uploaded as packs
+    /// fill, and are referenceable once `flush` returns (every ref write flushes first).
     pub async fn put_objects(&self, objs: Vec<Encoded>) -> Result<()> {
-        stream::iter(objs)
-            .map(|obj| self.put_object(obj))
-            .buffer_unordered(CONCURRENCY)
-            .try_collect::<()>()
-            .await
+        self.objects.put(objs).await
     }
 
-    async fn put_object(&self, obj: Encoded) -> Result<()> {
-        if self.known.lock().unwrap().contains(&obj.id) {
-            return Ok(());
-        }
-        // One upload per object at a time (two files often share chunks). If it fails, a
-        // waiting caller tries again itself.
-        let cell = self
-            .uploading
-            .lock()
-            .unwrap()
-            .entry(obj.id)
-            .or_default()
-            .clone();
-        let result = cell.get_or_try_init(|| self.upload(&obj)).await.map(|_| ());
-        self.uploading.lock().unwrap().remove(&obj.id);
-        if result.is_ok() {
-            self.known.lock().unwrap().insert(obj.id);
-        }
-        result
+    /// Uploads the open packs and an index segment listing them.
+    pub async fn flush(&self) -> Result<()> {
+        self.objects.flush().await
     }
 
-    /// HEAD, then PUT if the object isn't stored yet.
-    async fn upload(&self, obj: &Encoded) -> Result<()> {
-        let key = object_key(obj.ty, &obj.id);
-        let _permit = self.requests.acquire().await.expect("never closed");
-        if self.backend.head(&key).await?.is_none() {
-            let stored = obj.to_stored();
-            let len = stored.len() as u64;
-            self.backend
-                .put(&key, Bytes::from(stored), PutMode::Overwrite)
-                .await?;
-            self.uploaded_objects.fetch_add(1, Ordering::Relaxed);
-            self.uploaded_bytes.fetch_add(len, Ordering::Relaxed);
-        }
-        Ok(())
+    /// Fetches index segments other writers have added since the last sync.
+    pub async fn sync_index(&self) -> Result<()> {
+        self.objects.sync_index(None).await
     }
 
     fn encode<T: Object>(&self, obj: &T) -> Encoded {
@@ -439,10 +383,8 @@ impl Repo {
 
     async fn resolve_prefix(&self, prefix: &str) -> Result<Id> {
         let mut found = Vec::new();
-        for key in self.backend.list(&format!("meta/{prefix}")).await? {
-            let Ok(id) = key["meta/".len()..].parse::<Id>() else {
-                continue;
-            };
+        for id in self.objects.commits_with_prefix(prefix).await? {
+            // Loose `meta/` keys (before R1) may be any metadata type.
             match self.get::<Commit>(&id).await {
                 Ok(_) => found.push(id),
                 Err(Error::Corrupt {
@@ -659,6 +601,7 @@ impl Repo {
             created_at: rfc3339(now_ns()),
             created_by: self.identity.updated_by(),
         };
+        self.flush().await?;
         let body = serde_json::to_vec_pretty(&snap).expect("snapshot serializes");
         match self
             .backend
@@ -725,6 +668,8 @@ impl Repo {
     /// Commits a local directory to a branch (created if missing, CAS otherwise).
     pub async fn import(&self, dir: &Path, branch: &BranchName, message: &str) -> Result<Imported> {
         self.upgrade_format().await?;
+        // Objects other machines stored are skipped too.
+        self.sync_index().await?;
         let before = self.uploaded();
         let skipped = AtomicUsize::new(0);
         let slots = tokio::sync::Semaphore::new(IMPORT_FILES);

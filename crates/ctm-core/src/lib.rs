@@ -9,6 +9,7 @@ pub mod encoding;
 pub mod id;
 pub mod layout;
 pub mod object;
+pub mod pack;
 pub mod rechunk;
 
 pub use chunker::ChunkerParams;

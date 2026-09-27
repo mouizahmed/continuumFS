@@ -60,6 +60,19 @@ pub trait Backend: Send + Sync + 'static {
     async fn list(&self, prefix: &str) -> Result<Vec<String>>;
     /// Removes a key; deleting a missing key is not an error.
     async fn delete(&self, key: &str) -> Result<()>;
+
+    /// Bytes `range` of an object (for reading one object out of a pack). The default reads
+    /// the whole object; real backends ask for just the range.
+    async fn get_range(&self, key: &str, range: std::ops::Range<u64>) -> Result<Bytes> {
+        let (body, _) = self.get(key).await?;
+        let (start, end) = (range.start as usize, range.end as usize);
+        if end > body.len() || start > end {
+            return Err(Error::Backend(format!(
+                "{key}: range {range:?} past the end"
+            )));
+        }
+        Ok(body.slice(start..end))
+    }
 }
 
 /// Opens the backend for a repo URL: `s3://bucket/prefix` (AWS S3, or any S3-compatible

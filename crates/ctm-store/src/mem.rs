@@ -69,6 +69,17 @@ impl Backend for MemBackend {
             .collect())
     }
 
+    async fn get_range(&self, key: &str, range: std::ops::Range<u64>) -> Result<Bytes> {
+        let (body, _) = self.get(key).await?;
+        let (start, end) = (range.start as usize, range.end as usize);
+        if end > body.len() || start > end {
+            return Err(Error::Backend(format!(
+                "{key}: range {range:?} past the end"
+            )));
+        }
+        Ok(body.slice(start..end))
+    }
+
     async fn delete(&self, key: &str) -> Result<()> {
         self.inner.lock().unwrap().objects.remove(key);
         Ok(())

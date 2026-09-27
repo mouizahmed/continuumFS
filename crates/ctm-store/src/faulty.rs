@@ -140,6 +140,11 @@ impl<B: Backend> Backend for FaultyBackend<B> {
         self.inner.list(prefix).await
     }
 
+    async fn get_range(&self, key: &str, range: std::ops::Range<u64>) -> Result<Bytes> {
+        self.before(false).await?;
+        self.inner.get_range(key, range).await
+    }
+
     async fn delete(&self, key: &str) -> Result<()> {
         self.before(true).await?;
         self.inner.delete(key).await

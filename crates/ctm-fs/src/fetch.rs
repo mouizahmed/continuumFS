@@ -16,7 +16,7 @@ use tokio::sync::Semaphore;
 
 use ctm_core::encoding::{VerifyError, decode_verified};
 use ctm_core::{Chunk, ChunkRef, Id, Object, Tree};
-use ctm_repo::{Repo, object_key};
+use ctm_repo::Repo;
 use ctm_store::cache::{CacheStats, ChunkCache, MetaCache};
 
 /// Decoded trees kept in memory; the whole map is dropped when it fills up.
@@ -99,11 +99,13 @@ impl Fetcher {
             None
         };
         let _permit = self.foreground.acquire().await.expect("never closed");
-        let key = object_key(T::TYPE, id);
         let repo = &self.repo;
         let mut retried = false;
         loop {
-            let (bytes, _) = repo.backend().get(&key).await.map_err(FetchError::new)?;
+            let bytes = repo
+                .read_stored(T::TYPE, id)
+                .await
+                .map_err(FetchError::new)?;
             match decode_verified::<T>(repo.key(), id, &bytes, repo.params()) {
                 Ok(obj) => return Ok((obj, bytes.to_vec())),
                 Err(VerifyError::HashMismatch { .. }) if !retried => retried = true,

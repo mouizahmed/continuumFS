@@ -177,6 +177,24 @@ impl Backend for FileBackend {
             .await
     }
 
+    async fn get_range(&self, key: &str, range: std::ops::Range<u64>) -> Result<Bytes> {
+        let path = self.path(key)?;
+        let key = key.to_string();
+        self.blocking(move |_| {
+            use std::os::unix::fs::FileExt;
+            let f = match File::open(&path) {
+                Ok(f) => f,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(Error::NotFound(key)),
+                Err(e) => return Err(e.into()),
+            };
+            let mut buf = vec![0; (range.end - range.start) as usize];
+            f.read_exact_at(&mut buf, range.start)
+                .map_err(|e| Error::Backend(format!("{key}: range {range:?}: {e}")))?;
+            Ok(Bytes::from(buf))
+        })
+        .await
+    }
+
     async fn delete(&self, key: &str) -> Result<()> {
         let path = self.path(key)?;
         self.blocking(move |_| match fs::remove_file(&path) {

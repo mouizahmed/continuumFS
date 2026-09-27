@@ -33,7 +33,15 @@ pub async fn open_repo() -> Result<Repo> {
     let config = load_config()?;
     let (_, entry) = config.default_repo()?;
     let backend = ctm_store::open(&entry.url, entry.endpoint.as_deref())?;
-    Ok(Repo::open(backend, identity(&config)?).await?)
+    open_at(backend, identity(&config)?).await
+}
+
+/// Opens a repo with its index mirror in the repo's cache directory.
+pub async fn open_at(backend: Arc<dyn ctm_store::Backend>, identity: Identity) -> Result<Repo> {
+    let repo = Repo::open(backend, identity).await?;
+    let dir = paths::cache_dir(&repo.config().repo_id);
+    std::fs::create_dir_all(&dir)?;
+    Ok(repo.with_index_at(&dir.join("index.db"))?)
 }
 
 pub async fn init(url: &str, endpoint: Option<&str>) -> Result<()> {

@@ -10,10 +10,9 @@ use std::time::Duration;
 
 use ctm_fs::{Errno, FileKind, MountOptions, MountState};
 use ctm_repo::{BranchName, Identity, Repo};
-use ctm_store::{Backend, PutMode};
 
 mod common;
-use common::{Counting, lookup_path, random_bytes, read_all};
+use common::{Counting, corrupt_chunks, lookup_path, packed_chunks, random_bytes, read_all};
 
 struct Fixture {
     backend: Arc<Counting>,
@@ -175,7 +174,7 @@ async fn every_chunk_is_downloaded_once_and_then_served_from_cache() {
     let ino = lookup_path(&f.state, "big.bin").await.unwrap();
     assert_eq!(read_all(&f.state, ino).await, random_bytes(1, BIG));
     tokio::time::sleep(Duration::from_millis(300)).await;
-    let chunks = f.backend.inner.list("chunks/").await.unwrap().len();
+    let chunks = packed_chunks(&f.backend.inner).await.len();
     // big.bin and one_chunk.bin share no chunks; big.bin has all but one.
     assert_eq!(f.backend.chunk_gets.load(Ordering::SeqCst), chunks - 1);
     read_all(&f.state, ino).await;
@@ -231,18 +230,7 @@ async fn lookups_are_counted_and_forgotten() {
 #[tokio::test]
 async fn a_corrupt_chunk_reads_as_eio() {
     let f = mount().await;
-    for key in f.backend.inner.list("chunks/").await.unwrap() {
-        let (mut body, _) = f.backend.inner.get(&key).await.unwrap();
-        let mut v = body.to_vec();
-        let last = v.len() - 1;
-        v[last] ^= 1;
-        body = v.into();
-        f.backend
-            .inner
-            .put(&key, body, PutMode::Overwrite)
-            .await
-            .unwrap();
-    }
+    corrupt_chunks(&f.backend.inner).await;
     let ino = lookup_path(&f.state, "one_chunk.bin").await.unwrap();
     let fh = f.state.open_file(ino, false).await.unwrap();
     assert_eq!(f.state.read(fh, ino, 0, 10).await, Err(Errno::EIO));

@@ -74,6 +74,22 @@ async fn conformance(be: Arc<dyn Backend>) {
     assert_eq!(be.list("refs/").await.unwrap(), ["refs/branches/main"]);
     assert!(be.list("nothing/").await.unwrap().is_empty());
 
+    // Ranges.
+    be.put("packs/p", b("0123456789"), PutMode::Overwrite)
+        .await
+        .unwrap();
+    assert_eq!(be.get_range("packs/p", 2..5).await.unwrap(), b("234"));
+    assert_eq!(
+        be.get_range("packs/p", 0..10).await.unwrap(),
+        b("0123456789")
+    );
+    assert_eq!(be.get_range("packs/p", 7..7).await.unwrap(), b(""));
+    assert!(matches!(
+        be.get_range("packs/missing", 0..1).await,
+        Err(Error::NotFound(_))
+    ));
+    be.delete("packs/p").await.unwrap();
+
     // Delete.
     be.delete("meta/80").await.unwrap();
     assert_eq!(be.head("meta/80").await.unwrap(), None);

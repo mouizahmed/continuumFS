@@ -142,6 +142,21 @@ impl Backend for S3Backend {
         Ok(keys)
     }
 
+    async fn get_range(&self, key: &str, range: std::ops::Range<u64>) -> Result<Bytes> {
+        // S3 has no empty ranges; answer like the other backends.
+        if range.is_empty() {
+            self.head(key)
+                .await?
+                .ok_or_else(|| Error::NotFound(key.to_string()))?;
+            return Ok(Bytes::new());
+        }
+        match self.store.get_range(&self.path(key), range).await {
+            Ok(b) => Ok(b),
+            Err(object_store::Error::NotFound { .. }) => Err(Error::NotFound(key.to_string())),
+            Err(e) => Err(store_error(e)),
+        }
+    }
+
     async fn delete(&self, key: &str) -> Result<()> {
         match self.store.delete(&self.path(key)).await {
             Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
