@@ -36,11 +36,26 @@ impl BranchName {
         &self.0
     }
 
-    /// The branch a lost push moves to: `<self>.<host>`, then `-2`, `-3`, … when taken.
-    /// `host` is lowercased, with characters outside `[a-z0-9-]` replaced by `-`.
-    pub fn auto_fork(&self, host: &str, attempt: u32) -> BranchName {
-        let _ = (host, attempt);
-        todo!("M3: auto-fork name")
+    /// The branch a lost push moves to: `<self>.<host>`, then `-2`, `-3`, … for later
+    /// attempts. `host` is lowercased, with characters outside `[a-z0-9-]` replaced by `-`.
+    pub fn auto_fork(&self, host: &str, attempt: u32) -> crate::Result<BranchName> {
+        let host: String = host
+            .chars()
+            .map(|c| {
+                let c = c.to_ascii_lowercase();
+                if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let name = format!("{}.{host}", self.0);
+        if attempt <= 1 {
+            BranchName::new(&name)
+        } else {
+            BranchName::new(&format!("{name}-{attempt}"))
+        }
     }
 
     pub fn branch_key(&self) -> String {

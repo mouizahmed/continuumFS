@@ -247,6 +247,28 @@ async fn faulty_backend_crashes_after_n_puts_and_heals() {
 }
 
 #[tokio::test]
+async fn a_crash_can_land_the_put_it_interrupts() {
+    let be = FaultyBackend::new(
+        MemBackend::new(),
+        Faults {
+            crash_after_puts: Some(1),
+            crash_lands_put: true,
+            ..Faults::default()
+        },
+    );
+    be.put("a", b("1"), PutMode::Overwrite).await.unwrap();
+    assert!(be.put("b", b("2"), PutMode::Overwrite).await.is_err());
+    assert!(be.put("c", b("3"), PutMode::Overwrite).await.is_err());
+    be.heal();
+    assert_eq!(
+        be.get("b").await.unwrap().0,
+        b("2"),
+        "the crashing put landed"
+    );
+    assert_eq!(be.head("c").await.unwrap(), None, "later puts did not");
+}
+
+#[tokio::test]
 async fn faulty_backend_errors_are_deterministic() {
     let run = || async {
         let be = FaultyBackend::new(

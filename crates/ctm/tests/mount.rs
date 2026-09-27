@@ -201,3 +201,150 @@ fn snapshots_mount_read_only_without_the_flag() {
     assert_eq!(err.raw_os_error(), Some(libc_erofs()));
     env.ok(&["unmount", &env.path("snap")]);
 }
+
+fn mounts(env: &Env) -> usize {
+    fs::read_dir(env.home.join(".local/share/continuum/mounts"))
+        .map(|d| d.count())
+        .unwrap_or(0)
+}
+
+#[test]
+fn a_read_write_mount_commits_and_survives_remounts() {
+    if !fuse_available() {
+        return;
+    }
+    let env = Env::new();
+    repo_with_main(&env);
+    let mnt = env.work.join("mnt");
+    fs::create_dir(&mnt).unwrap();
+    env.ok(&["mount", "main", &env.path("mnt")]);
+
+    // Edits through the kernel: append, create, nested dirs, rename, delete, symlink.
+    let mut notes = fs::OpenOptions::new()
+        .append(true)
+        .open(mnt.join("notes.txt"))
+        .unwrap();
+    std::io::Write::write_all(&mut notes, b"more\n").unwrap();
+    drop(notes);
+    fs::create_dir_all(mnt.join("d/e")).unwrap();
+    fs::write(mnt.join("d/e/f.txt"), "deep\n").unwrap();
+    fs::rename(
+        mnt.join("project/src/main.rs"),
+        mnt.join("project/src/lib.rs"),
+    )
+    .unwrap();
+    fs::remove_file(mnt.join("big.bin")).unwrap();
+    std::os::unix::fs::symlink("notes.txt", mnt.join("link2")).unwrap();
+    let status = env.ok(&["status", &env.path("mnt")]);
+    // notes.txt, f.txt, lib.rs, link2, and the deleted main.rs and big.bin.
+    assert!(status.contains("Changes: 6"), "{status}");
+
+    let out = env.ok(&["commit", &env.path("mnt"), "-m", "edits"]);
+    assert!(out.starts_with("Committed"), "{out}");
+    assert_eq!(env.ok(&["cat", "main:notes.txt"]), "hello\nmore\n");
+    assert_eq!(env.ok(&["cat", "main:d/e/f.txt"]), "deep\n");
+    assert!(env.run(&["cat", "main:big.bin"]).status.code() != Some(0));
+
+    // Unmounting commits whatever is left.
+    fs::write(mnt.join("late.txt"), "late\n").unwrap();
+    let before = checksums(&mnt);
+    env.ok(&["unmount", &env.path("mnt")]);
+    assert_eq!(env.ok(&["cat", "main:late.txt"]), "late\n");
+    assert_eq!(mounts(&env), 0, "a clean unmount leaves no working state");
+    env.ok(&["mount", "main", &env.path("mnt")]);
+    assert_eq!(checksums(&mnt), before);
+    env.ok(&["unmount", &env.path("mnt")]);
+}
+
+#[test]
+fn uncommitted_work_survives_a_killed_mount_and_no_commit_unmounts() {
+    if !fuse_available() {
+        return;
+    }
+    let env = Env::new();
+    repo_with_main(&env);
+    let mnt = env.work.join("mnt");
+    fs::create_dir(&mnt).unwrap();
+    env.ok(&["mount", "main", &env.path("mnt")]);
+
+    // Not fsynced: the bytes sit in staging and the extent map in state.db.
+    fs::write(mnt.join("wip.txt"), "work in progress\n").unwrap();
+    kill_9(mount_pid(&env));
+    env.ok(&["mount", "main", &env.path("mnt")]);
+    assert_eq!(
+        fs::read_to_string(mnt.join("wip.txt")).unwrap(),
+        "work in progress\n"
+    );
+
+    env.ok(&["unmount", "--no-commit", &env.path("mnt")]);
+    assert!(env.run(&["cat", "main:wip.txt"]).status.code() != Some(0));
+    // Another branch can't take over the directory while its changes are uncommitted.
+    env.ok(&["fork", "main", "other"]);
+    let err = env.fails(&["mount", "other", &env.path("mnt")]);
+    assert!(err.contains("uncommitted changes"), "{err}");
+    env.ok(&["mount", "main", &env.path("mnt")]);
+    env.ok(&["unmount", &env.path("mnt")]);
+    assert_eq!(env.ok(&["cat", "main:wip.txt"]), "work in progress\n");
+}
+
+#[test]
+fn two_mounts_of_one_branch_race_and_one_auto_forks() {
+    if !fuse_available() {
+        return;
+    }
+    let env = Env::new();
+    repo_with_main(&env);
+    let (a, b) = (env.work.join("a"), env.work.join("b"));
+    fs::create_dir(&a).unwrap();
+    fs::create_dir(&b).unwrap();
+    env.ok(&["mount", "main", &env.path("a")]);
+    env.ok(&["mount", "main", &env.path("b")]);
+    fs::write(a.join("notes.txt"), "from a\n").unwrap();
+    fs::write(b.join("notes.txt"), "from b\n").unwrap();
+    assert!(env.ok(&["commit", &env.path("a")]).starts_with("Committed"));
+    let out = env.ok(&["commit", &env.path("b")]);
+    assert!(
+        out.contains("main moved on another machine. Your changes are safe on main."),
+        "{out}"
+    );
+    let branches = env.ok(&["branch", "list"]);
+    assert_eq!(branches.lines().count(), 2, "{branches}");
+    let fork = branches.lines().find(|l| *l != "main").unwrap().to_string();
+    assert_eq!(env.ok(&["cat", "main:notes.txt"]), "from a\n");
+    assert_eq!(env.ok(&["cat", &format!("{fork}:notes.txt")]), "from b\n");
+    let status = env.ok(&["status", &env.path("b")]);
+    assert!(
+        status.contains(&format!("Branch: {fork} (auto-forked from main)")),
+        "{status}"
+    );
+    env.ok(&["unmount", &env.path("a")]);
+    env.ok(&["unmount", &env.path("b")]);
+}
+
+#[test]
+fn restore_replaces_a_path_inside_a_mount() {
+    if !fuse_available() {
+        return;
+    }
+    let env = Env::new();
+    repo_with_main(&env);
+    let mnt = env.work.join("mnt");
+    fs::create_dir(&mnt).unwrap();
+    env.ok(&["mount", "main", &env.path("mnt")]);
+    // Read it first, so the kernel caches the old contents.
+    assert_eq!(
+        fs::read_to_string(mnt.join("notes.txt")).unwrap(),
+        "hello\n"
+    );
+    fs::write(mnt.join("notes.txt"), "broken\n").unwrap();
+    assert_eq!(
+        fs::read_to_string(mnt.join("notes.txt")).unwrap(),
+        "broken\n"
+    );
+    env.ok(&["restore", &env.path("mnt/notes.txt"), "--at", "main"]);
+    assert_eq!(
+        fs::read_to_string(mnt.join("notes.txt")).unwrap(),
+        "hello\n"
+    );
+    env.ok(&["unmount", &env.path("mnt")]);
+}

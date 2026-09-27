@@ -181,8 +181,8 @@ async fn run(command: Command) -> Result<()> {
         Command::MountProcess { state_dir } => mount::run(state_dir).await,
         Command::Cache(CacheCommand::Stats { json }) => mount::cache_stats(json).await,
         Command::Unmount { dir, no_commit } => mount::unmount(&dir, no_commit).await,
-        Command::Commit { .. } => todo!("M3: ctm commit"),
-        Command::Status { .. } => todo!("M3: ctm status"),
-        Command::Restore { .. } => todo!("M3: ctm restore"),
+        Command::Commit { dir, message } => mount::commit_cmd(&dir, &message).await,
+        Command::Status { dir } => mount::status(&dir).await,
+        Command::Restore { path, at } => mount::restore(&path, &at).await,
     }
 }

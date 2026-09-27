@@ -5,58 +5,15 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt, symlink};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use async_trait::async_trait;
-use bytes::Bytes;
 use ctm_fs::{Errno, FileKind, MountOptions, MountState};
 use ctm_repo::{BranchName, Identity, Repo};
-use ctm_store::{Backend, ETag, MemBackend, PutMode};
+use ctm_store::{Backend, PutMode};
 
-/// Counts GETs of chunks and metadata objects.
-#[derive(Default)]
-struct Counting {
-    inner: MemBackend,
-    chunk_gets: AtomicUsize,
-    meta_gets: AtomicUsize,
-}
-
-#[async_trait]
-impl Backend for Counting {
-    async fn get(&self, key: &str) -> ctm_store::Result<(Bytes, ETag)> {
-        if key.starts_with("chunks/") {
-            self.chunk_gets.fetch_add(1, Ordering::SeqCst);
-        } else if key.starts_with("meta/") {
-            self.meta_gets.fetch_add(1, Ordering::SeqCst);
-        }
-        self.inner.get(key).await
-    }
-    async fn head(&self, key: &str) -> ctm_store::Result<Option<ETag>> {
-        self.inner.head(key).await
-    }
-    async fn put(&self, key: &str, body: Bytes, mode: PutMode) -> ctm_store::Result<ETag> {
-        self.inner.put(key, body, mode).await
-    }
-    async fn list(&self, prefix: &str) -> ctm_store::Result<Vec<String>> {
-        self.inner.list(prefix).await
-    }
-    async fn delete(&self, key: &str) -> ctm_store::Result<()> {
-        self.inner.delete(key).await
-    }
-}
-
-fn random_bytes(seed: u64, len: usize) -> Vec<u8> {
-    let mut x = seed | 1;
-    (0..len)
-        .map(|_| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x as u8
-        })
-        .collect()
-}
+mod common;
+use common::{Counting, lookup_path, random_bytes, read_all};
 
 struct Fixture {
     backend: Arc<Counting>,
@@ -110,31 +67,6 @@ async fn mount() -> Fixture {
         src,
         _dirs: dirs,
     }
-}
-
-async fn lookup_path(state: &MountState, path: &str) -> Result<u64, Errno> {
-    let mut ino = 1;
-    for part in path.split('/').filter(|p| !p.is_empty()) {
-        ino = state.lookup(ino, part.as_bytes()).await?.ino;
-    }
-    Ok(ino)
-}
-
-async fn read_all(state: &MountState, ino: u64) -> Vec<u8> {
-    let fh = state.open_file(ino, false).await.unwrap();
-    let mut out = Vec::new();
-    loop {
-        let chunk = state
-            .read(fh, ino, out.len() as u64, 128 * 1024)
-            .await
-            .unwrap();
-        if chunk.is_empty() {
-            break;
-        }
-        out.extend_from_slice(&chunk);
-    }
-    state.release(fh).await.unwrap();
-    out
 }
 
 #[derive(Debug, PartialEq, Eq)]

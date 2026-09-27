@@ -3,14 +3,22 @@
 //! [`MountState`] holds all filesystem logic and is tested directly, without FUSE.
 //! [`fuse`] adapts it to the kernel.
 
+mod commit;
+mod db;
 mod fetch;
 pub mod fuse;
 mod inode;
 mod state;
 
 pub use state::{
-    Attr, CommitOutcome, DirItem, Fh, FileKind, MountOptions, MountState, SetAttr, StatFs, Status,
+    Attr, CommitOutcome, DirItem, Fh, FileKind, Invalidate, MountOptions, MountState, SetAttr,
+    StatFs, Status,
 };
+
+/// Whether a mount's working-state directory holds uncommitted changes.
+pub fn has_local_changes(state_dir: &std::path::Path) -> Result<bool> {
+    db::WorkDb::has_changes(state_dir)
+}
 
 /// A filesystem error, carried to the kernel as an errno.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +48,8 @@ pub enum Error {
     Store(#[from] ctm_store::Error),
     #[error("mounting a path inside a ref isn't supported; mount the ref itself")]
     PathInRef,
+    #[error("this mount is read-only")]
+    ReadOnly,
     #[error("{0} has uncommitted changes for branch {1}; mount that branch to commit them")]
     StateForOtherBranch(String, String),
     #[error(transparent)]

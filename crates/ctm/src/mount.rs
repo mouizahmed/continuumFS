@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
-use ctm_fs::{MountOptions, MountState, fuse};
+use ctm_fs::{CommitOutcome, MountOptions, MountState, fuse};
 use ctm_repo::{RefSpec, Repo, refspec::RefTarget};
 
 use crate::Result;
@@ -146,21 +146,43 @@ fn parse_size(s: &str) -> Result<u64> {
     Ok(n * mult)
 }
 
+/// Whether a mount's working state should outlive it: read-write, with uncommitted changes.
+fn keeps_state(record: &MountRecord) -> bool {
+    !record.read_only && ctm_fs::has_local_changes(&record.state_dir()).unwrap_or(true)
+}
+
 pub async fn mount(spec: &str, dir: &Path, read_only: bool, foreground: bool) -> Result<()> {
     let config = load_config()?;
     let (_, entry) = config.default_repo()?;
     let parsed: RefSpec = spec.parse()?;
     let is_branch = matches!(parsed.target, RefTarget::Branch(_));
-    if is_branch && !read_only {
-        return Err("read-write mounts arrive with writes; pass --read-only for now".into());
-    }
+    let read_only = read_only || !is_branch;
     let mountpoint = absolute(dir)?;
+    let backend = ctm_store::open(&entry.url, entry.endpoint.as_deref())?;
+    let repo = Repo::open(backend, identity(&config)?).await?;
+    let repo_id = repo.config().repo_id.clone();
+
+    // A mount of this directory left behind by a crash, `--no-commit`, or a failed commit.
+    let mut reuse = None;
     if let Some(old) = find_record(&mountpoint) {
         if alive(&old).await {
             return Err(format!("{} is already mounted", mountpoint.display()).into());
         }
         clear_stale(&mountpoint)?;
-        fs::remove_dir_all(old.state_dir())?;
+        if !keeps_state(&old) {
+            fs::remove_dir_all(old.state_dir())?;
+        } else if old.repo_id == repo_id && old.spec == spec && !read_only {
+            reuse = Some(old);
+        } else {
+            return Err(format!(
+                "{} has uncommitted changes for {}; mount that branch there to commit them, \
+                 or delete {} to discard them",
+                mountpoint.display(),
+                old.spec,
+                old.state_dir().display()
+            )
+            .into());
+        }
     } else {
         clear_stale(&mountpoint)?;
     }
@@ -168,17 +190,20 @@ pub async fn mount(spec: &str, dir: &Path, read_only: bool, foreground: bool) ->
     if !mountpoint.is_dir() {
         return Err(format!("{} is not a directory", mountpoint.display()).into());
     }
-    let backend = ctm_store::open(&entry.url, entry.endpoint.as_deref())?;
-    let repo = Repo::open(backend, identity(&config)?).await?;
-    repo.resolve(&parsed).await?; // Fail here, not in the background, on an unknown ref.
-    let record = MountRecord {
-        mount_id: uuid::Uuid::new_v4().simple().to_string(),
-        repo: entry.clone(),
-        repo_id: repo.config().repo_id.clone(),
-        spec: spec.to_string(),
-        mountpoint: mountpoint.clone(),
-        read_only: read_only || !is_branch,
-        pid: None,
+    let record = match reuse {
+        Some(old) => old,
+        None => {
+            repo.resolve(&parsed).await?; // Fail here, not in the background, on an unknown ref.
+            MountRecord {
+                mount_id: uuid::Uuid::new_v4().simple().to_string(),
+                repo: entry.clone(),
+                repo_id,
+                spec: spec.to_string(),
+                mountpoint: mountpoint.clone(),
+                read_only,
+                pid: None,
+            }
+        }
     };
     record.save()?;
     if foreground {
@@ -201,7 +226,9 @@ pub async fn mount(spec: &str, dir: &Path, read_only: bool, foreground: bool) ->
         }
         if let Some(status) = child.try_wait()? {
             let log = fs::read_to_string(record.state_dir().join("mount.log")).unwrap_or_default();
-            let _ = fs::remove_dir_all(record.state_dir());
+            if !keeps_state(&record) {
+                let _ = fs::remove_dir_all(record.state_dir());
+            }
             return Err(format!("the mount process exited ({status}):\n{log}").into());
         }
         if Instant::now() > deadline {
@@ -235,8 +262,17 @@ pub async fn run(state_dir: PathBuf) -> Result<()> {
         )
         .await?,
     );
+    // Recovery may have moved the mount to its auto-fork.
+    if let Some(branch) = state.branch()
+        && !state.read_only()
+        && branch.as_str() != record.spec
+    {
+        record.spec = branch.to_string();
+        record.save()?;
+    }
     let adapter = fuse::FuseAdapter::new(state.clone(), tokio::runtime::Handle::current());
     let session = fuse::spawn(adapter, &record.mountpoint, state.read_only())?;
+    fuse::connect_notifier(&session, &state);
 
     let socket = record.socket();
     fs::create_dir_all(socket.parent().expect("socket has a parent"))?;
@@ -259,7 +295,7 @@ pub async fn run(state_dir: PathBuf) -> Result<()> {
                         continue;
                     }
                 };
-                let (response, stop) = handle(&state, &record, &request);
+                let (response, stop) = handle(&state, &mut record, &request).await;
                 let mut out = serde_json::to_vec(&response)?;
                 out.push(b'\n');
                 let _ = write.write_all(&out).await;
@@ -274,38 +310,106 @@ pub async fn run(state_dir: PathBuf) -> Result<()> {
     drop(listener);
     let _ = fs::remove_file(&socket);
     tokio::task::spawn_blocking(move || session.umount_and_join()).await??;
-    fs::remove_dir_all(&state_dir)?;
+    drop(state);
+    if !keeps_state(&record) {
+        fs::remove_dir_all(&state_dir)?;
+    }
     Ok(())
 }
 
-fn handle(state: &MountState, record: &MountRecord, request: &Request) -> (Response, bool) {
+fn ok(message: String) -> Response {
+    Response::Ok { message }
+}
+
+fn error(message: impl std::fmt::Display) -> Response {
+    Response::Error {
+        message: message.to_string(),
+    }
+}
+
+/// Commits, and follows an auto-fork in `mount.json`.
+async fn commit(state: &MountState, record: &mut MountRecord, message: &str) -> Response {
+    match state.commit(message).await {
+        Ok(CommitOutcome::Pushed { commit }) => ok(format!(
+            "Committed {} to {}",
+            &commit.to_hex()[..12],
+            record.spec
+        )),
+        Ok(CommitOutcome::AutoForked { from, branch, .. }) => {
+            record.spec = branch.to_string();
+            if let Err(e) = record.save() {
+                tracing::warn!("updating mount.json: {e}");
+            }
+            ok(format!(
+                "{from} moved on another machine. Your changes are safe on {branch}."
+            ))
+        }
+        Ok(CommitOutcome::NothingToCommit) => ok("Nothing to commit".into()),
+        Err(e) => error(format!("commit failed: {e}")),
+    }
+}
+
+async fn handle(
+    state: &MountState,
+    record: &mut MountRecord,
+    request: &Request,
+) -> (Response, bool) {
     match request {
-        Request::Status => (
-            Response::Ok {
-                message: format!(
-                    "{} at commit {} ({})",
-                    record.spec,
-                    &state.base_commit().to_hex()[..12],
-                    if record.read_only {
-                        "read-only"
-                    } else {
-                        "read-write"
+        Request::Status => match state.status().await {
+            Ok(s) => {
+                let mut lines = Vec::new();
+                match (&s.branch, &s.auto_forked_from) {
+                    (Some(b), Some(from)) => {
+                        lines.push(format!("Branch: {b} (auto-forked from {from})"))
                     }
+                    (Some(b), None) => lines.push(format!("Branch: {b}")),
+                    (None, _) => lines.push(format!("Ref: {}", record.spec)),
+                }
+                lines.push(format!("Base commit: {}", &s.base_commit.to_hex()[..12]));
+                if s.read_only {
+                    lines.push("Read-only".into());
+                } else {
+                    lines.push(format!("Changes: {}", s.dirty_files));
+                }
+                if s.behind
+                    && let Some(b) = &s.branch
+                {
+                    lines.push(format!(
+                        "Behind: {b} moved on another machine since this mount's base"
+                    ));
+                }
+                (ok(lines.join("\n")), false)
+            }
+            Err(e) => (error(e), false),
+        },
+        Request::Commit { message } => (commit(state, record, message).await, false),
+        Request::Restore { path, at } => {
+            let spec = match at.parse() {
+                Ok(s) => s,
+                Err(e) => return (error(e), false),
+            };
+            match state.restore(path.as_bytes(), &spec).await {
+                Ok(()) => (ok(format!("Restored {path} from {at}")), false),
+                Err(e) => (error(e), false),
+            }
+        }
+        Request::Unmount { commit: true } if !state.read_only() => {
+            match commit(state, record, "").await {
+                Response::Ok { .. } => (
+                    ok(format!("Unmounted {}", record.mountpoint.display())),
+                    true,
                 ),
-            },
-            false,
-        ),
+                Response::Error { message } => (
+                    error(format!(
+                        "{message}; still mounted (retry, or pass --no-commit)"
+                    )),
+                    false,
+                ),
+            }
+        }
         Request::Unmount { .. } => (
-            Response::Ok {
-                message: format!("Unmounted {}", record.mountpoint.display()),
-            },
+            ok(format!("Unmounted {}", record.mountpoint.display())),
             true,
-        ),
-        Request::Commit { .. } | Request::Restore { .. } => (
-            Response::Error {
-                message: "this mount is read-only".into(),
-            },
-            false,
         ),
     }
 }
@@ -322,6 +426,66 @@ fn absolute(dir: &Path) -> Result<PathBuf> {
     }
 }
 
+/// The mount record for `dir`, or an error saying it isn't a mount.
+fn mount_at(dir: &Path) -> Result<MountRecord> {
+    let mountpoint = absolute(dir)?;
+    find_record(&mountpoint)
+        .ok_or_else(|| format!("{} is not a ctm mount", mountpoint.display()).into())
+}
+
+async fn call(record: &MountRecord, request: &Request) -> Result<String> {
+    match control::call(&record.socket(), request).await {
+        Ok(Response::Ok { message }) => Ok(message),
+        Ok(Response::Error { message }) => Err(message.into()),
+        Err(e) => Err(format!(
+            "the mount at {} isn't running ({e}); run `ctm mount` again",
+            record.mountpoint.display()
+        )
+        .into()),
+    }
+}
+
+pub async fn commit_cmd(dir: &Path, message: &str) -> Result<()> {
+    let record = mount_at(dir)?;
+    println!(
+        "{}",
+        call(
+            &record,
+            &Request::Commit {
+                message: message.to_string()
+            }
+        )
+        .await?
+    );
+    Ok(())
+}
+
+pub async fn status(dir: &Path) -> Result<()> {
+    println!("{}", call(&mount_at(dir)?, &Request::Status).await?);
+    Ok(())
+}
+
+pub async fn restore(path: &Path, at: &str) -> Result<()> {
+    let path = absolute(path)?;
+    let record = records()
+        .into_iter()
+        .filter(|r| path.starts_with(&r.mountpoint) && path != r.mountpoint)
+        .max_by_key(|r| r.mountpoint.as_os_str().len())
+        .ok_or_else(|| format!("{} is not inside a ctm mount", path.display()))?;
+    let rel = path
+        .strip_prefix(&record.mountpoint)
+        .expect("filtered above")
+        .to_str()
+        .ok_or("the path isn't valid UTF-8")?
+        .to_string();
+    let request = Request::Restore {
+        path: rel,
+        at: at.to_string(),
+    };
+    println!("{}", call(&record, &request).await?);
+    Ok(())
+}
+
 pub async fn unmount(dir: &Path, no_commit: bool) -> Result<()> {
     let mountpoint = absolute(dir)?;
     let Some(record) = find_record(&mountpoint) else {
@@ -334,21 +498,41 @@ pub async fn unmount(dir: &Path, no_commit: bool) -> Result<()> {
     };
     match control::call(&record.socket(), &Request::Unmount { commit: !no_commit }).await {
         Ok(Response::Ok { message }) => {
+            // Wait for the mount process to finish unmounting and exit.
+            let pid = MountRecord::load(&record.state_dir())
+                .ok()
+                .and_then(|r| r.pid);
             let deadline = Instant::now() + Duration::from_secs(60);
-            while is_mounted(&mountpoint) || record.state_dir().exists() {
+            while is_mounted(&mountpoint)
+                || pid.is_some_and(|p| Path::new(&format!("/proc/{p}")).exists())
+            {
                 if Instant::now() > deadline {
                     return Err("timed out waiting for the unmount".into());
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             println!("{message}");
+            if keeps_state(&record) && record.state_dir().exists() {
+                println!(
+                    "Uncommitted changes are kept for the next `ctm mount {}` here",
+                    record.spec
+                );
+            }
         }
         Ok(Response::Error { message }) => return Err(message.into()),
         Err(_) => {
             // The mount process is gone.
             clear_stale(&mountpoint)?;
-            fs::remove_dir_all(record.state_dir())?;
-            println!("Cleared a stale mount at {}", mountpoint.display());
+            if keeps_state(&record) {
+                println!(
+                    "Cleared a stale mount at {}; its uncommitted changes are kept for the next `ctm mount {}` there",
+                    mountpoint.display(),
+                    record.spec
+                );
+            } else {
+                fs::remove_dir_all(record.state_dir())?;
+                println!("Cleared a stale mount at {}", mountpoint.display());
+            }
         }
     }
     Ok(())

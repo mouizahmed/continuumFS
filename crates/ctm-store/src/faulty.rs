@@ -14,6 +14,8 @@ pub struct Faults {
     pub latency: Duration,
     /// After this many successful PUTs, the backend "crashes": every later call fails.
     pub crash_after_puts: Option<usize>,
+    /// The crashing PUT reaches the bucket before the crash, so only its answer is lost.
+    pub crash_lands_put: bool,
     /// Each call fails with this probability (0.0–1.0), deterministically from `seed`.
     pub error_rate: f64,
     pub seed: u64,
@@ -28,7 +30,15 @@ struct State {
     faults: Faults,
     puts: usize,
     crashed: bool,
+    /// Set by the PUT that crashed the backend, until that PUT has seen it.
+    crashing_put: bool,
     rng: u64,
+}
+
+impl State {
+    fn puts_at_crash(&mut self) -> bool {
+        std::mem::take(&mut self.crashing_put)
+    }
 }
 
 impl<B: Backend> FaultyBackend<B> {
@@ -40,6 +50,7 @@ impl<B: Backend> FaultyBackend<B> {
                 faults,
                 puts: 0,
                 crashed: false,
+                crashing_put: false,
                 rng,
             }),
         }
@@ -47,6 +58,15 @@ impl<B: Backend> FaultyBackend<B> {
 
     pub fn inner(&self) -> &B {
         &self.inner
+    }
+
+    /// Replaces the faults; `crash_after_puts` counts from now.
+    pub fn set_faults(&self, faults: Faults) {
+        let mut s = self.state.lock().unwrap();
+        s.rng = faults.seed ^ 0x9e37_79b9_7f4a_7c15;
+        s.faults = faults;
+        s.puts = 0;
+        s.crashed = false;
     }
 
     /// Clears every fault, as if the process restarted with a healthy network.
@@ -68,6 +88,7 @@ impl<B: Backend> FaultyBackend<B> {
         }
         if put && s.faults.crash_after_puts.is_some_and(|n| s.puts >= n) {
             s.crashed = true;
+            s.crashing_put = true;
             return Err(injected("crashed"));
         }
         if s.faults.error_rate > 0.0 {
@@ -102,7 +123,13 @@ impl<B: Backend> Backend for FaultyBackend<B> {
     }
 
     async fn put(&self, key: &str, body: Bytes, mode: PutMode) -> Result<ETag> {
-        self.before(true).await?;
+        let lands = self.state.lock().unwrap().faults.crash_lands_put;
+        if let Err(e) = self.before(true).await {
+            if lands && self.state.lock().unwrap().puts_at_crash() {
+                let _ = self.inner.put(key, body, mode).await;
+            }
+            return Err(e);
+        }
         let etag = self.inner.put(key, body, mode).await?;
         self.state.lock().unwrap().puts += 1;
         Ok(etag)

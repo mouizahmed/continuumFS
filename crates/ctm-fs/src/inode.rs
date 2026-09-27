@@ -1,42 +1,88 @@
 //! The in-memory inode table.
 //!
 //! Numbers are assigned on first lookup and never reused within a mount process, so the
-//! FUSE generation is always 0. A clean entry is dropped when the kernel forgets it; looking
-//! it up again assigns a new number. The root is always inode 1.
+//! FUSE generation is always 0. Changed entries (and their ancestors) stay in memory for the
+//! life of the mount; a clean entry is dropped when the kernel forgets it and no handle has it
+//! open. The root is always inode 1.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use ctm_core::DirEntry;
+use ctm_core::{DirEntry, Kind};
 
 pub const ROOT: u64 = 1;
 
 pub struct Node {
     pub parent: u64,
+    /// Name, mode, mtime, and current size. For a file, `content` is its base content (what
+    /// shows through where there are no dirty extents); for a directory, its base tree.
     pub entry: DirEntry,
-    lookups: u64,
+    /// Length of the base content, and how much of it can still show through.
+    pub base_len: u64,
+    pub base_visible: u64,
+    /// The file's bytes differ from its base content.
+    pub dirty: bool,
+    /// The entry differs from the base tree (it has a row in `state.db`).
+    pub changed: bool,
+    pub lookups: u64,
+    pub open: u32,
+    /// Removed from its directory while open; dropped at the last release.
+    pub unlinked: bool,
+}
+
+impl Node {
+    pub fn new(parent: u64, entry: DirEntry) -> Node {
+        Node {
+            parent,
+            base_len: entry.size,
+            base_visible: entry.size,
+            entry,
+            dirty: false,
+            changed: false,
+            lookups: 0,
+            open: 0,
+            unlinked: false,
+        }
+    }
+
+    pub fn kind(&self) -> Kind {
+        self.entry.content.kind()
+    }
 }
 
 pub struct Inodes {
     nodes: HashMap<u64, Node>,
-    names: HashMap<(u64, Vec<u8>), u64>,
+    children: HashMap<u64, BTreeMap<Vec<u8>, u64>>,
     next: u64,
 }
 
 impl Inodes {
     pub fn new(root: DirEntry) -> Inodes {
         let mut nodes = HashMap::new();
-        nodes.insert(
-            ROOT,
-            Node {
-                parent: ROOT,
-                entry: root,
-                lookups: 1,
-            },
-        );
+        let mut node = Node::new(ROOT, root);
+        node.lookups = 1;
+        nodes.insert(ROOT, node);
         Inodes {
             nodes,
-            names: HashMap::new(),
+            children: HashMap::new(),
             next: ROOT + 1,
+        }
+    }
+
+    /// Loads persisted rows, keeping their inode numbers.
+    pub fn load(&mut self, rows: Vec<(u64, Node)>) {
+        for (ino, node) in rows {
+            if ino == ROOT {
+                let root = self.nodes.get_mut(&ROOT).expect("root exists");
+                root.entry = node.entry;
+                root.changed = true;
+                continue;
+            }
+            self.next = self.next.max(ino + 1);
+            self.children
+                .entry(node.parent)
+                .or_default()
+                .insert(node.entry.name.clone(), ino);
+            self.nodes.insert(ino, node);
         }
     }
 
@@ -44,32 +90,76 @@ impl Inodes {
         self.nodes.get(&ino)
     }
 
-    /// The inode for `entry` in `parent`, counting one kernel lookup.
-    pub fn lookup(&mut self, parent: u64, entry: DirEntry) -> u64 {
-        let key = (parent, entry.name.clone());
-        if let Some(&ino) = self.names.get(&key) {
-            let node = self.nodes.get_mut(&ino).expect("names point at live nodes");
-            node.lookups += 1;
-            node.entry = entry;
-            return ino;
-        }
+    pub fn get_mut(&mut self, ino: u64) -> Option<&mut Node> {
+        self.nodes.get_mut(&ino)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (u64, &Node)> {
+        self.nodes.iter().map(|(i, n)| (*i, n))
+    }
+
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (u64, &mut Node)> {
+        self.nodes.iter_mut().map(|(i, n)| (*i, n))
+    }
+
+    pub fn child(&self, parent: u64, name: &[u8]) -> Option<u64> {
+        self.children.get(&parent)?.get(name).copied()
+    }
+
+    /// The live children of `parent` that are in memory, by name.
+    pub fn children(&self, parent: u64) -> Vec<(Vec<u8>, u64)> {
+        self.children
+            .get(&parent)
+            .map(|c| c.iter().map(|(n, i)| (n.clone(), *i)).collect())
+            .unwrap_or_default()
+    }
+
+    /// Adds a node under its parent and returns its new number.
+    pub fn insert(&mut self, node: Node) -> u64 {
         let ino = self.next;
         self.next += 1;
-        self.names.insert(key, ino);
-        self.nodes.insert(
-            ino,
-            Node {
-                parent,
-                entry,
-                lookups: 1,
-            },
-        );
+        self.children
+            .entry(node.parent)
+            .or_default()
+            .insert(node.entry.name.clone(), ino);
+        self.nodes.insert(ino, node);
         ino
     }
 
-    /// The inode already assigned to `name` in `parent`, if any.
-    pub fn peek(&self, parent: u64, name: &[u8]) -> Option<u64> {
-        self.names.get(&(parent, name.to_vec())).copied()
+    /// The inode for `entry` in `parent`, counting one kernel lookup.
+    pub fn lookup(&mut self, parent: u64, entry: DirEntry) -> u64 {
+        if let Some(ino) = self.child(parent, &entry.name) {
+            self.nodes.get_mut(&ino).expect("indexed").lookups += 1;
+            return ino;
+        }
+        let mut node = Node::new(parent, entry);
+        node.lookups = 1;
+        self.insert(node)
+    }
+
+    /// Removes a node from its directory's index (it stays in the table).
+    pub fn detach(&mut self, ino: u64) {
+        if let Some(n) = self.nodes.get(&ino)
+            && let Some(c) = self.children.get_mut(&n.parent)
+            && c.get(&n.entry.name) == Some(&ino)
+        {
+            c.remove(&n.entry.name);
+        }
+    }
+
+    /// Puts a detached node into `parent` under `name`.
+    pub fn attach(&mut self, ino: u64, parent: u64, name: Vec<u8>) {
+        let node = self.nodes.get_mut(&ino).expect("attaching a live node");
+        node.parent = parent;
+        node.entry.name = name.clone();
+        self.children.entry(parent).or_default().insert(name, ino);
+    }
+
+    /// Drops a node entirely.
+    pub fn remove(&mut self, ino: u64) -> Option<Node> {
+        self.detach(ino);
+        self.children.remove(&ino);
+        self.nodes.remove(&ino)
     }
 
     pub fn forget(&mut self, ino: u64, n: u64) {
@@ -80,9 +170,9 @@ impl Inodes {
             return;
         };
         node.lookups = node.lookups.saturating_sub(n);
-        if node.lookups == 0 {
-            let node = self.nodes.remove(&ino).expect("just found");
-            self.names.remove(&(node.parent, node.entry.name));
+        let has_children = self.children.get(&ino).is_some_and(|c| !c.is_empty());
+        if node.lookups == 0 && !node.changed && node.open == 0 && !has_children {
+            self.remove(ino);
         }
     }
 }

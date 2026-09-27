@@ -193,6 +193,13 @@ impl Fetcher {
         }
     }
 
+    /// Adds a chunk this machine just wrote to the cache.
+    pub fn cache_chunk(&self, id: &Id, bytes: &[u8]) {
+        if let Err(e) = self.chunks.insert(id, bytes) {
+            tracing::warn!("caching chunk {id}: {e}");
+        }
+    }
+
     /// Starts downloading a chunk in the background, if it isn't cached or already coming.
     pub fn prefetch_chunk(self: &Arc<Self>, c: ChunkRef) {
         let this = self.clone();

@@ -16,12 +16,13 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use fuser::{
-    BackgroundSession, Config, Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags,
-    Generation, INodeNo, KernelConfig, LockOwner, MountOption, OpenAccMode, OpenFlags, ReplyAttr,
-    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, Request,
+    BackgroundSession, BsdFileFlags, Config, Errno, FileAttr, FileHandle, FileType, Filesystem,
+    FopenFlags, Generation, INodeNo, KernelConfig, LockOwner, MountOption, OpenAccMode, OpenFlags,
+    RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
+    ReplyOpen, ReplyStatfs, ReplyWrite, ReplyXattr, Request, TimeOrNow, WriteFlags,
 };
 
-use crate::{Attr, Fh, FileKind, MountState};
+use crate::{Attr, Fh, FileKind, Invalidate, MountState, SetAttr};
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -86,6 +87,28 @@ fn errno(e: crate::Errno) -> Errno {
     Errno::from_i32(e.0)
 }
 
+fn ns(t: SystemTime) -> i64 {
+    match t.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(d) => d.as_nanos() as i64,
+        Err(e) => -(e.duration().as_nanos() as i64),
+    }
+}
+
+/// Replies to an operation that yields an entry.
+fn reply_entry(reply: ReplyEntry, owner: Owner, r: crate::FsResult<Attr>) {
+    match r {
+        Ok(a) => reply.entry(&TTL, &owner.attr(&a), Generation(0)),
+        Err(e) => reply.error(errno(e)),
+    }
+}
+
+fn reply_empty(reply: ReplyEmpty, r: crate::FsResult<()>) {
+    match r {
+        Ok(()) => reply.ok(),
+        Err(e) => reply.error(errno(e)),
+    }
+}
+
 fn time_from_ns(ns: i64) -> SystemTime {
     let d = Duration::new(
         ns.unsigned_abs() / 1_000_000_000,
@@ -145,10 +168,296 @@ impl Filesystem for FuseAdapter {
         let write = flags.acc_mode() != OpenAccMode::O_RDONLY;
         self.rt.spawn(async move {
             match state.open_file(ino.0, write).await {
-                Ok(fh) => reply.opened(FileHandle(fh.0), FopenFlags::FOPEN_KEEP_CACHE),
+                Ok(fh) => {
+                    // Clean files keep the kernel's cached pages; the view can't change.
+                    let flags = if state.keep_cache(ino.0) {
+                        FopenFlags::FOPEN_KEEP_CACHE
+                    } else {
+                        FopenFlags::empty()
+                    };
+                    reply.opened(FileHandle(fh.0), flags)
+                }
                 Err(e) => reply.error(errno(e)),
             }
         });
+    }
+
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        _fh: Option<FileHandle>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        _flags: Option<BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        let (state, owner) = (self.state.clone(), self.owner);
+        // Everything is owned by the mounting user: chown to them is a no-op.
+        if uid.is_some_and(|u| u != owner.uid) || gid.is_some_and(|g| g != owner.gid) {
+            return reply.error(Errno::EPERM);
+        }
+        let set = SetAttr {
+            size,
+            mode: mode.map(|m| (m & 0o7777) as u16),
+            mtime_ns: mtime.map(|t| match t {
+                TimeOrNow::SpecificTime(t) => ns(t),
+                TimeOrNow::Now => ns(SystemTime::now()),
+            }),
+        };
+        self.rt.spawn(async move {
+            let r = if set == SetAttr::default() {
+                state.getattr(ino.0).await
+            } else {
+                state.setattr(ino.0, set).await
+            };
+            match r {
+                Ok(a) => reply.attr(&TTL, &owner.attr(&a)),
+                Err(e) => reply.error(errno(e)),
+            }
+        });
+    }
+
+    fn mknod(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        _rdev: u32,
+        reply: ReplyEntry,
+    ) {
+        // Regular files only; FIFOs, sockets, and device nodes aren't supported.
+        if mode & libc::S_IFMT != libc::S_IFREG {
+            return reply.error(Errno::ENOTSUP);
+        }
+        let (state, owner, name) = (self.state.clone(), self.owner, name.as_bytes().to_vec());
+        let mode = (mode & !umask & 0o7777) as u16;
+        self.rt.spawn(async move {
+            let r = match state.create(parent.0, &name, mode).await {
+                Ok((a, fh)) => state.release(fh).await.map(|()| a),
+                Err(e) => Err(e),
+            };
+            reply_entry(reply, owner, r);
+        });
+    }
+
+    fn mkdir(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        reply: ReplyEntry,
+    ) {
+        let (state, owner, name) = (self.state.clone(), self.owner, name.as_bytes().to_vec());
+        let mode = (mode & !umask & 0o7777) as u16;
+        self.rt.spawn(async move {
+            reply_entry(reply, owner, state.mkdir(parent.0, &name, mode).await);
+        });
+    }
+
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let (state, name) = (self.state.clone(), name.as_bytes().to_vec());
+        self.rt.spawn(async move {
+            reply_empty(reply, state.unlink(parent.0, &name).await);
+        });
+    }
+
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let (state, name) = (self.state.clone(), name.as_bytes().to_vec());
+        self.rt.spawn(async move {
+            reply_empty(reply, state.rmdir(parent.0, &name).await);
+        });
+    }
+
+    fn symlink(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        link_name: &OsStr,
+        target: &Path,
+        reply: ReplyEntry,
+    ) {
+        let (state, owner) = (self.state.clone(), self.owner);
+        let name = link_name.as_bytes().to_vec();
+        let target = target.as_os_str().as_bytes().to_vec();
+        self.rt.spawn(async move {
+            reply_entry(reply, owner, state.symlink(parent.0, &name, &target).await);
+        });
+    }
+
+    fn rename(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        newparent: INodeNo,
+        newname: &OsStr,
+        flags: RenameFlags,
+        reply: ReplyEmpty,
+    ) {
+        if flags.contains(RenameFlags::RENAME_EXCHANGE) {
+            return reply.error(Errno::EINVAL);
+        }
+        let no_replace = flags.contains(RenameFlags::RENAME_NOREPLACE);
+        let state = self.state.clone();
+        let (name, newname) = (name.as_bytes().to_vec(), newname.as_bytes().to_vec());
+        self.rt.spawn(async move {
+            let r = state
+                .rename(parent.0, &name, newparent.0, &newname, no_replace)
+                .await;
+            reply_empty(reply, r);
+        });
+    }
+
+    fn link(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _newparent: INodeNo,
+        _newname: &OsStr,
+        reply: ReplyEntry,
+    ) {
+        reply.error(Errno::EPERM);
+    }
+
+    fn write(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        data: &[u8],
+        _write_flags: WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
+        reply: ReplyWrite,
+    ) {
+        let (state, data) = (self.state.clone(), data.to_vec());
+        self.rt.spawn(async move {
+            match state.write(Fh(fh.0), ino.0, offset, &data).await {
+                Ok(n) => reply.written(n),
+                Err(e) => reply.error(errno(e)),
+            }
+        });
+    }
+
+    fn create(
+        &self,
+        _req: &Request,
+        parent: INodeNo,
+        name: &OsStr,
+        mode: u32,
+        umask: u32,
+        _flags: i32,
+        reply: ReplyCreate,
+    ) {
+        let (state, owner, name) = (self.state.clone(), self.owner, name.as_bytes().to_vec());
+        let mode = (mode & !umask & 0o7777) as u16;
+        self.rt.spawn(async move {
+            match state.create(parent.0, &name, mode).await {
+                Ok((a, fh)) => reply.created(
+                    &TTL,
+                    &owner.attr(&a),
+                    Generation(0),
+                    FileHandle(fh.0),
+                    FopenFlags::empty(),
+                ),
+                Err(e) => reply.error(errno(e)),
+            }
+        });
+    }
+
+    fn flush(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _lock_owner: LockOwner,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
+    fn fsync(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        let state = self.state.clone();
+        self.rt.spawn(async move {
+            reply_empty(reply, state.fsync(ino.0).await);
+        });
+    }
+
+    fn fsyncdir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
+    fn setxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _value: &[u8],
+        _flags: i32,
+        _position: u32,
+        reply: ReplyEmpty,
+    ) {
+        reply.error(Errno::ENOTSUP);
+    }
+
+    fn getxattr(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _name: &OsStr,
+        _size: u32,
+        reply: ReplyXattr,
+    ) {
+        reply.error(Errno::ENOTSUP);
+    }
+
+    fn listxattr(&self, _req: &Request, _ino: INodeNo, _size: u32, reply: ReplyXattr) {
+        reply.error(Errno::ENOTSUP);
+    }
+
+    fn removexattr(&self, _req: &Request, _ino: INodeNo, _name: &OsStr, reply: ReplyEmpty) {
+        reply.error(Errno::ENOTSUP);
+    }
+
+    fn fallocate(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _offset: u64,
+        _length: u64,
+        _mode: i32,
+        reply: ReplyEmpty,
+    ) {
+        reply.error(Errno::ENOTSUP);
     }
 
     fn read(
@@ -240,6 +549,25 @@ impl Filesystem for FuseAdapter {
             Err(e) => reply.error(errno(e)),
         }
     }
+}
+
+/// Sends the mount's invalidations (from `restore`) to the kernel through `session`.
+pub fn connect_notifier(session: &BackgroundSession, state: &MountState) {
+    let notifier = session.notifier();
+    state.set_notifier(Box::new(move |i| {
+        let r = match &i {
+            Invalidate::Inode(ino) => notifier.inval_inode(INodeNo(*ino), 0, 0),
+            Invalidate::Entry { parent, name } => {
+                notifier.inval_entry(INodeNo(*parent), OsStr::from_bytes(name))
+            }
+        };
+        // ENOENT just means the kernel had nothing cached.
+        if let Err(e) = r
+            && e.raw_os_error() != Some(libc::ENOENT)
+        {
+            tracing::warn!("invalidating {i:?}: {e}");
+        }
+    }));
 }
 
 /// Mounts `adapter` at `mountpoint` and returns the running session. Dropping the session,

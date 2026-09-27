@@ -1,18 +1,27 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs::File;
+use std::ops::Range;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::{StreamExt, stream};
 use tokio::sync::OnceCell;
 use tokio::task::JoinHandle;
 
 use ctm_core::layout::PAGE_MAX;
-use ctm_core::{ChunkList, ChunkPage, ChunkRef, Commit, Content, DirEntry, Id, Kind, Tree};
-use ctm_repo::{BranchName, RefSpec, Repo};
+use ctm_core::{
+    ChunkList, ChunkPage, ChunkRef, Commit, Content, DirEntry, Id, Kind, Object, ObjectType, Tree,
+};
+use ctm_repo::refspec::RefTarget;
+use ctm_repo::{BranchName, BranchRef, RefSpec, Repo};
+use ctm_store::ETag;
 
+use crate::db::{self, WorkDb};
 use crate::fetch::{FetchError, Fetcher};
-use crate::inode::{Inodes, ROOT};
+use crate::inode::{Inodes, Node, ROOT};
 use crate::{Errno, Error, FsResult, Result};
 
 /// Readahead window, in chunks: where it starts once a handle reads sequentially, and its cap.
@@ -102,6 +111,7 @@ pub enum CommitOutcome {
     },
     /// The branch moved on another machine; the commit went to `branch`, and the mount follows it.
     AutoForked {
+        from: BranchName,
         branch: BranchName,
         commit: Id,
     },
@@ -110,22 +120,35 @@ pub enum CommitOutcome {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Status {
-    pub branch: BranchName,
+    /// `None` for a snapshot or commit mount.
+    pub branch: Option<BranchName>,
     pub base_commit: Id,
+    /// Files and symlinks with uncommitted changes, plus deleted entries.
     pub dirty_files: u64,
     /// The remote ref's ETag differs from this mount's base.
     pub behind: bool,
     /// Set after an auto-fork: the branch the mount was on before.
     pub auto_forked_from: Option<BranchName>,
+    pub read_only: bool,
+}
+
+/// Receives invalidations (the FUSE session's notifier).
+pub type Notifier = Box<dyn Fn(Invalidate) + Send + Sync>;
+
+/// A kernel cache entry to drop after the mount's contents change underneath it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Invalidate {
+    Inode(u64),
+    Entry { parent: u64, name: Vec<u8> },
+}
+
+/// Where a file's chunks are: one page per 4096 chunks, each loaded on first use.
+pub(crate) struct Layout {
+    pages: Vec<PageSpan>,
 }
 
 /// A page's chunks with their offsets in the file, sorted.
 type PageChunks = Arc<Vec<(u64, ChunkRef)>>;
-
-/// Where a file's chunks are: one page per 4096 chunks, each loaded on first use.
-struct Layout {
-    pages: Vec<PageSpan>,
-}
 
 struct PageSpan {
     start: u64,
@@ -153,6 +176,7 @@ impl Pos {
 
 #[derive(Default)]
 struct Handle {
+    ino: u64,
     next_offset: u64,
     sequential: u32,
     /// Readahead window in chunks; 0 until the handle reads sequentially.
@@ -162,18 +186,103 @@ struct Handle {
     prefetched_to: Option<u64>,
 }
 
+/// What the mount is based on.
+#[derive(Clone, Debug)]
+pub(crate) struct Base {
+    pub branch: Option<BranchName>,
+    pub commit: Id,
+    pub root: Id,
+    pub branch_ref: Option<BranchRef>,
+    pub etag: Option<ETag>,
+    pub auto_forked_from: Option<BranchName>,
+}
+
+/// A commit that was built but whose ref update has an unknown outcome.
+pub(crate) struct Unresolved {
+    pub prepared: crate::commit::Prepared,
+}
+
+/// Everything that changes, behind one lock.
+pub(crate) struct Inner {
+    pub inodes: Inodes,
+    pub whiteouts: HashSet<(u64, Vec<u8>)>,
+    pub extents: HashMap<u64, Vec<Range<u64>>>,
+    /// `None` for read-only mounts, which keep no working state.
+    pub db: Option<WorkDb>,
+    pub base: Base,
+    pub unresolved: Option<Unresolved>,
+}
+
+impl Inner {
+    pub fn db(&mut self) -> &mut WorkDb {
+        self.db
+            .as_mut()
+            .expect("read-write mounts have a working state")
+    }
+
+    /// Marks `ino` and its ancestors changed, and saves them and `ino`'s extents.
+    pub fn touch(&mut self, ino: u64) -> Result<()> {
+        let mut save = vec![ino];
+        self.inodes
+            .get_mut(ino)
+            .expect("touching a live node")
+            .changed = true;
+        let mut cur = ino;
+        while cur != ROOT {
+            let parent = self.inodes.get(cur).expect("live").parent;
+            let p = self.inodes.get_mut(parent).expect("parents are live");
+            if p.changed {
+                break;
+            }
+            p.changed = true;
+            save.push(parent);
+            cur = parent;
+        }
+        let Inner {
+            inodes,
+            extents,
+            db,
+            ..
+        } = self;
+        let no_extents = Vec::new();
+        db.as_mut().expect("read-write").tx(|t| {
+            for i in &save {
+                db::save_node(t, *i, inodes.get(*i).expect("live"))?;
+            }
+            db::set_extents(t, ino, extents.get(&ino).unwrap_or(&no_extents))
+        })
+    }
+}
+
+/// A file's bytes as of one moment: base content, dirty extents, and its staging file.
+pub(crate) struct FileView {
+    pub entry: DirEntry,
+    pub size: u64,
+    /// Length of the base content in `entry`.
+    pub base_len: u64,
+    pub base_visible: u64,
+    pub dirty: bool,
+    pub extents: Vec<Range<u64>>,
+    pub staging: Option<Arc<File>>,
+}
+
 /// All filesystem logic for one mounted ref.
 pub struct MountState {
-    repo: Arc<Repo>,
-    fetcher: Arc<Fetcher>,
-    inodes: Mutex<Inodes>,
+    pub(crate) repo: Arc<Repo>,
+    pub(crate) fetcher: Arc<Fetcher>,
+    pub(crate) inner: Mutex<Inner>,
+    /// Write operations hold it shared; commit holds it exclusively. Reads never take it.
+    pub(crate) gate: tokio::sync::RwLock<()>,
     handles: Mutex<HashMap<u64, Handle>>,
     next_fh: AtomicU64,
     layouts: Mutex<HashMap<Id, Arc<Layout>>>,
     prefetched_dirs: Mutex<HashSet<Id>>,
-    read_only: bool,
+    staging: Mutex<HashMap<u64, Arc<File>>>,
+    pub(crate) read_only: bool,
     cache_dir: PathBuf,
-    commit: Id,
+    pub(crate) state_dir: PathBuf,
+    pub(crate) empty_tree: Id,
+    notify: Mutex<Option<Notifier>>,
     walker: JoinHandle<()>,
 }
 
@@ -183,18 +292,29 @@ impl Drop for MountState {
     }
 }
 
-fn eio(e: FetchError) -> Errno {
+pub(crate) fn eio(e: FetchError) -> Errno {
     tracing::error!("{e}");
     Errno::EIO
 }
 
-fn attr(ino: u64, e: &DirEntry) -> Attr {
+pub(crate) fn fail(e: Error) -> Errno {
+    tracing::error!("{e}");
+    Errno::EIO
+}
+
+pub(crate) fn now_ns() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as i64)
+}
+
+fn attr(ino: u64, n: &Node) -> Attr {
     Attr {
         ino,
-        kind: e.content.kind().into(),
-        size: e.size,
-        mode: e.mode,
-        mtime_ns: e.mtime_ns,
+        kind: n.kind().into(),
+        size: n.entry.size,
+        mode: n.entry.mode,
+        mtime_ns: n.entry.mtime_ns,
         nlink: 1,
     }
 }
@@ -209,9 +329,45 @@ fn synthetic_ino(parent: u64, name: &[u8]) -> u64 {
     (1 << 63) | u64::from_le_bytes(h.as_bytes()[..8].try_into().expect("8 bytes"))
 }
 
+fn check_name(name: &[u8]) -> FsResult<()> {
+    if name.len() > 255 {
+        return Err(Errno::ENAMETOOLONG);
+    }
+    if name.is_empty() || name == b"." || name == b".." || name.contains(&b'/') {
+        return Err(Errno::EINVAL);
+    }
+    Ok(())
+}
+
+/// Adds `r` to sorted, non-overlapping extents, merging where they touch.
+fn merge_extent(extents: &mut Vec<Range<u64>>, r: Range<u64>) {
+    let mut merged = r;
+    extents.retain(|e| {
+        if e.end < merged.start || e.start > merged.end {
+            true
+        } else {
+            merged = merged.start.min(e.start)..merged.end.max(e.end);
+            false
+        }
+    });
+    let at = extents.partition_point(|e| e.start < merged.start);
+    extents.insert(at, merged);
+}
+
+fn io_errno(e: Errno) -> Error {
+    Error::Io(std::io::Error::from_raw_os_error(e.0))
+}
+
+/// A merged directory listing entry: a node in memory, or a base entry not looked up yet.
+enum Listed {
+    Node(u64),
+    Base(DirEntry),
+}
+
 impl MountState {
-    /// Opens the working state in `state_dir` for `spec`. Snapshots and commit IDs always
-    /// mount read-only. `cache_dir` is the repo's shared cache directory.
+    /// Opens (or recovers) the working state in `state_dir` for `spec`, finishing an
+    /// interrupted commit first. Snapshots and commit IDs always mount read-only.
+    /// `cache_dir` is the repo's shared cache directory.
     pub async fn open(
         repo: Arc<Repo>,
         cache_dir: &Path,
@@ -219,19 +375,71 @@ impl MountState {
         spec: &RefSpec,
         opts: MountOptions,
     ) -> Result<MountState> {
-        let _ = state_dir; // Working state arrives with writes (M3).
         if spec.path.is_some() {
             return Err(Error::PathInRef);
         }
-        let resolved = repo.resolve(spec).await?;
         let fetcher = Arc::new(Fetcher::new(
             repo.clone(),
             cache_dir,
             opts.chunk_cache_max,
             opts.max_concurrency,
         )?);
+        let empty_tree = Id::compute(repo.key(), ObjectType::Tree, &Tree::default().encode());
+        let branch = match &spec.target {
+            RefTarget::Branch(b) => Some(b.clone()),
+            _ => None,
+        };
+        let read_only = opts.read_only || branch.is_none();
+        let mut rows = Vec::new();
+        let mut whiteouts = HashSet::new();
+        let mut extents = HashMap::new();
+        let (db, base) = if read_only {
+            let r = repo.resolve(spec).await?;
+            let base = Base {
+                branch,
+                commit: r.commit,
+                root: r.root_tree,
+                branch_ref: r.branch.as_ref().map(|(_, b, _)| b.clone()),
+                etag: r.branch.map(|(_, _, e)| e),
+                auto_forked_from: None,
+            };
+            (None, base)
+        } else {
+            let branch = branch.expect("read-write mounts are of branches");
+            let mut db = WorkDb::open(state_dir)?;
+            let base = match crate::commit::load_base(&db)? {
+                Some(base) => {
+                    if base.branch.as_ref() != Some(&branch) {
+                        return Err(Error::StateForOtherBranch(
+                            state_dir.display().to_string(),
+                            base.branch.map(|b| b.to_string()).unwrap_or_default(),
+                        ));
+                    }
+                    crate::commit::recover_at_open(&repo, &mut db, state_dir, base).await?
+                }
+                None => {
+                    let r = repo.resolve(spec).await?;
+                    let (_, branch_ref, etag) = r.branch.expect("branch refs resolve to a branch");
+                    let base = Base {
+                        branch: Some(branch),
+                        commit: r.commit,
+                        root: r.root_tree,
+                        branch_ref: Some(branch_ref),
+                        etag: Some(etag),
+                        auto_forked_from: None,
+                    };
+                    db.tx(|t| crate::commit::save_base(t, &base))?;
+                    base
+                }
+            };
+            let (r, w, e) = db.load()?;
+            rows = r.into_iter().map(|row| (row.ino, row.node)).collect();
+            whiteouts = w.into_iter().collect();
+            extents = e;
+            (Some(db), base)
+        };
         let commit = fetcher
-            .meta::<Commit>(&resolved.commit, false)
+            .meta::<Commit>(&base.commit, false)
             .await
             .map_err(|e| Error::Io(std::io::Error::other(e)))?;
         let root = DirEntry {
@@ -239,22 +447,45 @@ impl MountState {
             mode: 0o755,
             mtime_ns: commit.time_ns,
             size: 0,
-            content: Content::Dir(resolved.root_tree),
+            content: Content::Dir(base.root),
             btime_ns: None,
             xattrs: None,
         };
-        let walker = tokio::spawn(walk_metadata(fetcher.clone(), resolved.root_tree));
+        let mut inodes = Inodes::new(root);
+        let live: HashSet<u64> = rows.iter().map(|(i, _)| *i).collect();
+        inodes.load(rows);
+        if !read_only {
+            // Staging files with no row belong to files unlinked before a crash.
+            for f in std::fs::read_dir(state_dir.join("staging"))?.flatten() {
+                let ino = f.file_name().to_string_lossy().parse::<u64>().ok();
+                if ino.is_none_or(|i| !live.contains(&i)) {
+                    let _ = std::fs::remove_file(f.path());
+                }
+            }
+        }
+        let walker = tokio::spawn(walk_metadata(fetcher.clone(), base.root, empty_tree));
         Ok(MountState {
-            read_only: opts.read_only || resolved.branch.is_none(),
+            read_only,
             repo,
             fetcher,
-            inodes: Mutex::new(Inodes::new(root)),
+            inner: Mutex::new(Inner {
+                inodes,
+                whiteouts,
+                extents,
+                db,
+                base,
+                unresolved: None,
+            }),
+            gate: tokio::sync::RwLock::new(()),
             handles: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
             layouts: Mutex::new(HashMap::new()),
             prefetched_dirs: Mutex::new(HashSet::new()),
+            staging: Mutex::new(HashMap::new()),
             cache_dir: cache_dir.to_path_buf(),
-            commit: resolved.commit,
+            state_dir: state_dir.to_path_buf(),
+            empty_tree,
+            notify: Mutex::new(None),
             walker,
         })
     }
@@ -267,30 +498,73 @@ impl MountState {
         self.read_only
     }
 
-    /// The commit this mount shows.
+    /// The commit this mount is based on.
     pub fn base_commit(&self) -> Id {
-        self.commit
+        self.lock().base.commit
+    }
+
+    /// The branch this mount writes to (it changes after an auto-fork).
+    pub fn branch(&self) -> Option<BranchName> {
+        self.lock().base.branch.clone()
     }
 
     pub fn cache_stats(&self) -> ctm_store::Result<ctm_store::cache::CacheStats> {
         self.fetcher.cache_stats()
     }
 
-    fn entry(&self, ino: u64) -> FsResult<DirEntry> {
-        let inodes = self.inodes.lock().unwrap();
-        inodes
-            .get(ino)
-            .map(|n| n.entry.clone())
-            .ok_or(Errno::ENOENT)
+    /// Where invalidations go (the FUSE session's notifier).
+    pub fn set_notifier(&self, f: Notifier) {
+        *self.notify.lock().unwrap() = Some(f);
     }
 
-    /// The tree of a directory inode, and a background prefetch of its subdirectories.
-    async fn dir_tree(&self, ino: u64) -> FsResult<Arc<Tree>> {
-        let Content::Dir(id) = self.entry(ino)?.content else {
-            return Err(Errno::ENOTDIR);
+    fn invalidate(&self, i: Invalidate) {
+        if let Some(f) = self.notify.lock().unwrap().as_ref() {
+            f(i);
+        }
+    }
+
+    pub(crate) fn lock(&self) -> MutexGuard<'_, Inner> {
+        self.inner.lock().unwrap()
+    }
+
+    /// Whether a file is unchanged, so the kernel may keep its cached pages.
+    pub fn keep_cache(&self, ino: u64) -> bool {
+        self.lock().inodes.get(ino).is_some_and(|n| !n.dirty)
+    }
+
+    /// Fails unless this mount can take writes right now.
+    fn writable(&self) -> FsResult<()> {
+        if self.read_only {
+            return Err(Errno::EROFS);
+        }
+        if self.lock().unresolved.is_some() {
+            tracing::error!("a commit's outcome is unknown; run `ctm commit` to resolve it");
+            return Err(Errno::EIO);
+        }
+        Ok(())
+    }
+
+    // Trees and directory listings
+
+    pub(crate) async fn tree(&self, id: Id) -> FsResult<Arc<Tree>> {
+        if id == self.empty_tree {
+            return Ok(Arc::new(Tree::default()));
+        }
+        self.fetcher.tree(&id, false).await.map_err(eio)
+    }
+
+    /// The base tree of a directory inode, and a background prefetch of its subdirectories.
+    async fn base_tree(&self, ino: u64) -> FsResult<Arc<Tree>> {
+        let id = {
+            let inner = self.lock();
+            let node = inner.inodes.get(ino).ok_or(Errno::ENOENT)?;
+            match node.entry.content {
+                Content::Dir(id) => id,
+                _ => return Err(Errno::ENOTDIR),
+            }
         };
-        let tree = self.fetcher.tree(&id, false).await.map_err(eio)?;
-        if self.prefetched_dirs.lock().unwrap().insert(id) {
+        let tree = self.tree(id).await?;
+        if id != self.empty_tree && self.prefetched_dirs.lock().unwrap().insert(id) {
             let fetcher = self.fetcher.clone();
             let children: Vec<Id> = tree
                 .entries
@@ -314,83 +588,347 @@ impl MountState {
         Ok(tree)
     }
 
+    /// A directory's entries: base entries minus whiteouts, overridden by nodes in memory.
+    async fn listing(&self, dir: u64) -> FsResult<BTreeMap<Vec<u8>, Listed>> {
+        let tree = self.base_tree(dir).await?;
+        let inner = self.lock();
+        let mut out = BTreeMap::new();
+        for e in &tree.entries {
+            if !inner.whiteouts.contains(&(dir, e.name.clone())) {
+                out.insert(e.name.clone(), Listed::Base(e.clone()));
+            }
+        }
+        for (name, ino) in inner.inodes.children(dir) {
+            out.insert(name, Listed::Node(ino));
+        }
+        Ok(out)
+    }
+
+    /// The node for `name` in `parent`, bringing a base entry into memory (without counting
+    /// a kernel lookup) if needed.
+    async fn child(&self, parent: u64, name: &[u8]) -> FsResult<Option<u64>> {
+        {
+            let inner = self.lock();
+            let p = inner.inodes.get(parent).ok_or(Errno::ENOENT)?;
+            if p.kind() != Kind::Dir {
+                return Err(Errno::ENOTDIR);
+            }
+            if let Some(ino) = inner.inodes.child(parent, name) {
+                return Ok(Some(ino));
+            }
+            if inner.whiteouts.contains(&(parent, name.to_vec())) {
+                return Ok(None);
+            }
+        }
+        let tree = self.base_tree(parent).await?;
+        let Ok(i) = tree
+            .entries
+            .binary_search_by(|e| e.name.as_slice().cmp(name))
+        else {
+            return Ok(None);
+        };
+        let mut inner = self.lock();
+        if let Some(ino) = inner.inodes.child(parent, name) {
+            return Ok(Some(ino));
+        }
+        Ok(Some(
+            inner
+                .inodes
+                .insert(Node::new(parent, tree.entries[i].clone())),
+        ))
+    }
+
+    /// Whether `parent`'s base tree has `name` (so deleting it needs a whiteout).
+    async fn in_base(&self, parent: u64, name: &[u8]) -> FsResult<bool> {
+        let tree = self.base_tree(parent).await?;
+        Ok(tree
+            .entries
+            .binary_search_by(|e| e.name.as_slice().cmp(name))
+            .is_ok())
+    }
+
     pub async fn lookup(&self, parent: u64, name: &[u8]) -> FsResult<Attr> {
-        let tree = self.dir_tree(parent).await?;
+        {
+            let mut inner = self.lock();
+            let p = inner.inodes.get(parent).ok_or(Errno::ENOENT)?;
+            if p.kind() != Kind::Dir {
+                return Err(Errno::ENOTDIR);
+            }
+            if let Some(ino) = inner.inodes.child(parent, name) {
+                let node = inner.inodes.get_mut(ino).expect("indexed");
+                node.lookups += 1;
+                return Ok(attr(ino, node));
+            }
+            if inner.whiteouts.contains(&(parent, name.to_vec())) {
+                return Err(Errno::ENOENT);
+            }
+        }
+        let tree = self.base_tree(parent).await?;
         let entry = tree
             .entries
             .binary_search_by(|e| e.name.as_slice().cmp(name))
             .map(|i| tree.entries[i].clone())
             .map_err(|_| Errno::ENOENT)?;
-        let ino = self.inodes.lock().unwrap().lookup(parent, entry.clone());
-        Ok(attr(ino, &entry))
+        let mut inner = self.lock();
+        let ino = inner.inodes.lookup(parent, entry);
+        Ok(attr(ino, inner.inodes.get(ino).expect("just looked up")))
     }
 
     pub fn forget(&self, ino: u64, nlookup: u64) {
-        self.inodes.lock().unwrap().forget(ino, nlookup);
+        self.lock().inodes.forget(ino, nlookup);
     }
 
     pub async fn getattr(&self, ino: u64) -> FsResult<Attr> {
-        Ok(attr(ino, &self.entry(ino)?))
-    }
-
-    pub async fn setattr(&self, ino: u64, set: SetAttr) -> FsResult<Attr> {
-        let _ = (ino, set);
-        todo!("M3: setattr")
+        let inner = self.lock();
+        inner
+            .inodes
+            .get(ino)
+            .map(|n| attr(ino, n))
+            .ok_or(Errno::ENOENT)
     }
 
     pub async fn readdir(&self, ino: u64) -> FsResult<Vec<DirItem>> {
-        let tree = self.dir_tree(ino).await?;
-        let inodes = self.inodes.lock().unwrap();
-        Ok(tree
-            .entries
-            .iter()
-            .map(|e| DirItem {
-                ino: inodes
-                    .peek(ino, &e.name)
-                    .unwrap_or_else(|| synthetic_ino(ino, &e.name)),
-                name: e.name.clone(),
-                kind: e.content.kind().into(),
+        let listing = self.listing(ino).await?;
+        let inner = self.lock();
+        Ok(listing
+            .into_iter()
+            .filter_map(|(name, l)| match l {
+                Listed::Node(i) => inner.inodes.get(i).map(|n| DirItem {
+                    ino: i,
+                    kind: n.kind().into(),
+                    name,
+                }),
+                Listed::Base(e) => Some(DirItem {
+                    ino: synthetic_ino(ino, &name),
+                    kind: e.content.kind().into(),
+                    name,
+                }),
             })
             .collect())
     }
 
     /// The parent of a directory inode (for `..`).
     pub fn parent(&self, ino: u64) -> u64 {
-        let inodes = self.inodes.lock().unwrap();
-        inodes.get(ino).map_or(ROOT, |n| n.parent)
+        self.lock().inodes.get(ino).map_or(ROOT, |n| n.parent)
     }
 
+    // Reads
+
     pub async fn open_file(&self, ino: u64, write: bool) -> FsResult<Fh> {
-        let entry = self.entry(ino)?;
-        if entry.content.kind() == Kind::Dir {
-            return Err(Errno::EISDIR);
-        }
         if write && self.read_only {
             return Err(Errno::EROFS);
         }
-        if write {
-            todo!("M3: open for writing");
+        {
+            let mut inner = self.lock();
+            let node = inner.inodes.get_mut(ino).ok_or(Errno::ENOENT)?;
+            if node.kind() == Kind::Dir {
+                return Err(Errno::EISDIR);
+            }
+            node.open += 1;
         }
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-        self.handles.lock().unwrap().insert(fh, Handle::default());
+        self.handles.lock().unwrap().insert(
+            fh,
+            Handle {
+                ino,
+                ..Handle::default()
+            },
+        );
         Ok(Fh(fh))
     }
 
-    async fn layout(&self, e: &DirEntry) -> FsResult<Arc<Layout>> {
-        let key = match e.content {
+    pub async fn release(&self, fh: Fh) -> FsResult<()> {
+        let Some(h) = self.handles.lock().unwrap().remove(&fh.0) else {
+            return Ok(());
+        };
+        let drop_staging = {
+            let mut inner = self.lock();
+            let Some(node) = inner.inodes.get_mut(h.ino) else {
+                return Ok(());
+            };
+            node.open = node.open.saturating_sub(1);
+            if node.open == 0 && node.unlinked {
+                inner.inodes.remove(h.ino);
+                inner.extents.remove(&h.ino);
+                true
+            } else {
+                // A clean entry the kernel already forgot goes once it's closed.
+                inner.inodes.forget(h.ino, 0);
+                false
+            }
+        };
+        if drop_staging {
+            self.drop_staging(h.ino);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn staging_file(&self, ino: u64, create: bool) -> FsResult<Option<Arc<File>>> {
+        let mut files = self.staging.lock().unwrap();
+        if let Some(f) = files.get(&ino) {
+            return Ok(Some(f.clone()));
+        }
+        let path = db::staging_path(&self.state_dir, ino);
+        let f = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(create)
+            .truncate(false)
+            .open(&path)
+        {
+            Ok(f) => Arc::new(f),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => {
+                tracing::error!("staging file {}: {e}", path.display());
+                return Err(Errno::EIO);
+            }
+        };
+        files.insert(ino, f.clone());
+        Ok(Some(f))
+    }
+
+    pub(crate) fn drop_staging(&self, ino: u64) {
+        self.staging.lock().unwrap().remove(&ino);
+        let path = db::staging_path(&self.state_dir, ino);
+        if let Err(e) = std::fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!("removing {}: {e}", path.display());
+        }
+    }
+
+    pub(crate) fn view(&self, ino: u64) -> FsResult<FileView> {
+        let (entry, size, base_len, base_visible, dirty, extents) = {
+            let inner = self.lock();
+            let n = inner.inodes.get(ino).ok_or(Errno::ENOENT)?;
+            if n.kind() == Kind::Dir {
+                return Err(Errno::EISDIR);
+            }
+            (
+                n.entry.clone(),
+                n.entry.size,
+                n.base_len,
+                n.base_visible,
+                n.dirty,
+                inner.extents.get(&ino).cloned().unwrap_or_default(),
+            )
+        };
+        let staging = if extents.is_empty() {
+            None
+        } else {
+            self.staging_file(ino, false)?
+        };
+        Ok(FileView {
+            entry,
+            size,
+            base_len,
+            base_visible,
+            dirty,
+            extents,
+            staging,
+        })
+    }
+
+    pub async fn read(&self, fh: Fh, ino: u64, offset: u64, len: u32) -> FsResult<Vec<u8>> {
+        let view = self.view(ino)?;
+        if view.dirty {
+            return self.read_view(&view, offset, u64::from(len)).await;
+        }
+        let end = (offset + u64::from(len)).min(view.size);
+        if offset >= end {
+            return Ok(Vec::new());
+        }
+        if let Content::Inline(b) = &view.entry.content {
+            return Ok(b[offset as usize..end as usize].to_vec());
+        }
+        let (bytes, layout, last) = self
+            .read_chunks(&view.entry.content, view.base_len, offset, end)
+            .await?;
+        self.readahead(fh, layout, offset, end, last);
+        Ok(bytes)
+    }
+
+    /// Bytes `[offset, offset + len)` of a file as of `view`: dirty extents from staging,
+    /// base bytes below `base_visible`, zeros elsewhere.
+    pub(crate) async fn read_view(
+        &self,
+        view: &FileView,
+        offset: u64,
+        len: u64,
+    ) -> FsResult<Vec<u8>> {
+        let end = (offset + len).min(view.size);
+        if offset >= end {
+            return Ok(Vec::new());
+        }
+        let mut out = vec![0; (end - offset) as usize];
+        // Base bytes, only where no extent covers them.
+        let base_end = end.min(view.base_visible);
+        let mut at = offset;
+        for e in view
+            .extents
+            .iter()
+            .chain(std::iter::once(&(u64::MAX..u64::MAX)))
+        {
+            if at >= base_end {
+                break;
+            }
+            let gap_end = e.start.min(base_end);
+            if at < gap_end {
+                let bytes = self
+                    .read_base(&view.entry.content, view.base_len, at, gap_end)
+                    .await?;
+                out[(at - offset) as usize..(gap_end - offset) as usize].copy_from_slice(&bytes);
+            }
+            at = at.max(e.end);
+        }
+        for e in &view.extents {
+            let (s, t) = (e.start.max(offset), e.end.min(end));
+            if s < t {
+                let f = view.staging.as_ref().ok_or(Errno::EIO)?;
+                f.read_exact_at(&mut out[(s - offset) as usize..(t - offset) as usize], s)
+                    .map_err(|err| {
+                        tracing::error!("reading staging: {err}");
+                        Errno::EIO
+                    })?;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Bytes `[offset, end)` of base content `base_len` bytes long.
+    async fn read_base(
+        &self,
+        content: &Content,
+        base_len: u64,
+        offset: u64,
+        end: u64,
+    ) -> FsResult<Vec<u8>> {
+        match content {
+            Content::Inline(b) => Ok(b[offset as usize..end as usize].to_vec()),
+            Content::Chunk(_) | Content::ChunkList(_) => {
+                Ok(self.read_chunks(content, base_len, offset, end).await?.0)
+            }
+            _ => Err(Errno::EISDIR),
+        }
+    }
+
+    /// The chunk layout of chunked base content `base_len` bytes long.
+    pub(crate) async fn layout(&self, content: &Content, base_len: u64) -> FsResult<Arc<Layout>> {
+        let key = match *content {
             Content::Chunk(id) | Content::ChunkList(id) => id,
             _ => return Err(Errno::EINVAL),
         };
         if let Some(l) = self.layouts.lock().unwrap().get(&key) {
             return Ok(l.clone());
         }
-        let layout = match e.content {
+        let layout = match *content {
             Content::Chunk(id) => Layout {
                 pages: vec![PageSpan {
                     start: 0,
                     source: PageSource::Single(ChunkRef {
                         id,
-                        len: e.size as u32,
+                        // A single-chunk file's chunk is the whole base file.
+                        len: base_len as u32,
                     }),
                     chunks: OnceCell::new(),
                 }],
@@ -453,6 +991,20 @@ impl MountState {
             .cloned()
     }
 
+    /// Every chunk of chunked base content, in order.
+    pub(crate) async fn all_chunks(
+        &self,
+        content: &Content,
+        base_len: u64,
+    ) -> FsResult<Vec<ChunkRef>> {
+        let layout = self.layout(content, base_len).await?;
+        let mut out = Vec::new();
+        for p in 0..layout.pages.len() {
+            out.extend(self.page(&layout, p).await?.iter().map(|(_, c)| *c));
+        }
+        Ok(out)
+    }
+
     /// The position of the chunk holding byte `offset` (which must be inside the file).
     async fn locate(&self, layout: &Layout, offset: u64) -> FsResult<Pos> {
         let page = layout.pages.partition_point(|p| p.start <= offset) - 1;
@@ -479,18 +1031,15 @@ impl MountState {
         })
     }
 
-    pub async fn read(&self, fh: Fh, ino: u64, offset: u64, len: u32) -> FsResult<Vec<u8>> {
-        let e = self.entry(ino)?;
-        let end = (offset + u64::from(len)).min(e.size);
-        if offset >= end {
-            return Ok(Vec::new());
-        }
-        match &e.content {
-            Content::Inline(b) => return Ok(b[offset as usize..end as usize].to_vec()),
-            Content::Chunk(_) | Content::ChunkList(_) => {}
-            _ => return Err(Errno::EISDIR),
-        }
-        let layout = self.layout(&e).await?;
+    /// Bytes `[offset, end)` of a chunked file, and the position of the last chunk read.
+    async fn read_chunks(
+        &self,
+        content: &Content,
+        base_len: u64,
+        offset: u64,
+        end: u64,
+    ) -> FsResult<(Vec<u8>, Arc<Layout>, Pos)> {
+        let layout = self.layout(content, base_len).await?;
         let mut out = vec![0; (end - offset) as usize];
         let mut pos = self.locate(&layout, offset).await?;
         let mut at = offset;
@@ -513,8 +1062,19 @@ impl MountState {
             }
             pos = self.next(&layout, pos).await?.ok_or(Errno::EIO)?;
         };
-        self.readahead(fh, layout, offset, end, last);
-        Ok(out)
+        Ok((out, layout, last))
+    }
+
+    /// Starts downloading the base chunk holding byte `offset`, if it isn't cached.
+    async fn prefetch_base(&self, content: &Content, base_len: u64, offset: u64) {
+        let Ok(layout) = self.layout(content, base_len).await else {
+            return;
+        };
+        if let Ok(pos) = self.locate(&layout, offset).await
+            && let Ok(chunks) = self.page(&layout, pos.page).await
+        {
+            self.fetcher.prefetch_chunk(chunks[pos.index].1);
+        }
     }
 
     /// Updates the handle's sequential-read state and starts downloading the chunks ahead.
@@ -531,7 +1091,10 @@ impl MountState {
             if offset == h.next_offset {
                 h.sequential += 1;
             } else {
-                *h = Handle::default();
+                *h = Handle {
+                    ino: h.ino,
+                    ..Handle::default()
+                };
             }
             h.next_offset = end;
             let chunk = last.global();
@@ -555,11 +1118,6 @@ impl MountState {
             (from, to)
         };
         let fetcher = self.fetcher.clone();
-        let this_page = move |g: u64| Pos {
-            page: g as usize / PAGE_MAX,
-            index: g as usize % PAGE_MAX,
-        };
-        // Resolving later pages may itself need a download, so it all runs in the background.
         let pages: Vec<(usize, PageChunks)> = layout
             .pages
             .iter()
@@ -568,11 +1126,12 @@ impl MountState {
             .collect();
         tokio::spawn(async move {
             for g in from..=to {
-                let pos = this_page(g);
-                let Some((_, chunks)) = pages.iter().find(|(i, _)| *i == pos.page) else {
-                    break; // The next page isn't loaded yet; the next read loads it.
+                let (page, index) = (g as usize / PAGE_MAX, g as usize % PAGE_MAX);
+                // A page not loaded yet is loaded by the next read that needs it.
+                let Some((_, chunks)) = pages.iter().find(|(i, _)| *i == page) else {
+                    break;
                 };
-                let Some((_, c)) = chunks.get(pos.index) else {
+                let Some((_, c)) = chunks.get(index) else {
                     break;
                 };
                 fetcher.prefetch_chunk(*c);
@@ -580,63 +1139,12 @@ impl MountState {
         });
     }
 
-    pub async fn write(&self, fh: Fh, ino: u64, offset: u64, data: &[u8]) -> FsResult<u32> {
-        let _ = (fh, ino, offset, data);
-        todo!("M3: write")
-    }
-
-    pub async fn create(&self, parent: u64, name: &[u8], mode: u16) -> FsResult<(Attr, Fh)> {
-        let _ = (parent, name, mode);
-        todo!("M3: create")
-    }
-
-    pub async fn mkdir(&self, parent: u64, name: &[u8], mode: u16) -> FsResult<Attr> {
-        let _ = (parent, name, mode);
-        todo!("M3: mkdir")
-    }
-
-    pub async fn unlink(&self, parent: u64, name: &[u8]) -> FsResult<()> {
-        let _ = (parent, name);
-        todo!("M3: unlink")
-    }
-
-    pub async fn rmdir(&self, parent: u64, name: &[u8]) -> FsResult<()> {
-        let _ = (parent, name);
-        todo!("M3: rmdir")
-    }
-
-    pub async fn rename(
-        &self,
-        parent: u64,
-        name: &[u8],
-        new_parent: u64,
-        new_name: &[u8],
-    ) -> FsResult<()> {
-        let _ = (parent, name, new_parent, new_name);
-        todo!("M3: rename")
-    }
-
-    pub async fn symlink(&self, parent: u64, name: &[u8], target: &[u8]) -> FsResult<Attr> {
-        let _ = (parent, name, target);
-        todo!("M3: symlink")
-    }
-
     pub async fn readlink(&self, ino: u64) -> FsResult<Vec<u8>> {
-        match self.entry(ino)?.content {
-            Content::Symlink(t) => Ok(t),
+        let inner = self.lock();
+        match &inner.inodes.get(ino).ok_or(Errno::ENOENT)?.entry.content {
+            Content::Symlink(t) => Ok(t.clone()),
             _ => Err(Errno::EINVAL),
         }
-    }
-
-    /// Makes the file's written bytes and extent map durable on this machine.
-    pub async fn fsync(&self, ino: u64) -> FsResult<()> {
-        let _ = ino;
-        todo!("M3: fsync")
-    }
-
-    pub async fn release(&self, fh: Fh) -> FsResult<()> {
-        self.handles.lock().unwrap().remove(&fh.0);
-        Ok(())
     }
 
     pub fn statfs(&self) -> FsResult<StatFs> {
@@ -649,29 +1157,425 @@ impl MountState {
         })
     }
 
-    /// Re-chunks dirty files, uploads, and CASes the branch ref; auto-forks on a lost race.
-    pub async fn commit(&self, message: &str) -> Result<CommitOutcome> {
-        let _ = message;
-        todo!("M3: commit")
+    // Writes
+
+    pub async fn write(&self, fh: Fh, ino: u64, offset: u64, data: &[u8]) -> FsResult<u32> {
+        let _ = fh;
+        let _gate = self.gate.read().await;
+        self.writable()?;
+        if self.lock().inodes.get(ino).ok_or(Errno::ENOENT)?.kind() != Kind::File {
+            return Err(Errno::EISDIR);
+        }
+        let staging = self.staging_file(ino, true)?.expect("created");
+        staging.write_all_at(data, offset).map_err(|e| {
+            tracing::error!("writing staging: {e}");
+            Errno::EIO
+        })?;
+        let end = offset + data.len() as u64;
+        let (content, base_len, base_visible) = {
+            let mut inner = self.lock();
+            merge_extent(inner.extents.entry(ino).or_default(), offset..end);
+            let node = inner.inodes.get_mut(ino).ok_or(Errno::ENOENT)?;
+            node.dirty = true;
+            node.entry.size = node.entry.size.max(end);
+            node.entry.mtime_ns = now_ns();
+            let snapshot = (node.entry.content.clone(), node.base_len, node.base_visible);
+            inner.touch(ino).map_err(fail)?;
+            snapshot
+        };
+        // Commit re-chunks from the base chunk holding the byte before the write and resyncs
+        // at the chunk holding its end; fetch those now so commit rarely waits.
+        if matches!(content, Content::Chunk(_) | Content::ChunkList(_)) {
+            if offset > 0 && offset - 1 < base_visible {
+                self.prefetch_base(&content, base_len, offset - 1).await;
+            }
+            if end < base_visible {
+                self.prefetch_base(&content, base_len, end).await;
+            }
+        }
+        Ok(data.len() as u32)
+    }
+
+    pub async fn setattr(&self, ino: u64, set: SetAttr) -> FsResult<Attr> {
+        let _gate = self.gate.read().await;
+        self.writable()?;
+        if let Some(n) = set.size {
+            let shrinks = {
+                let inner = self.lock();
+                let node = inner.inodes.get(ino).ok_or(Errno::ENOENT)?;
+                match node.kind() {
+                    Kind::Dir => return Err(Errno::EISDIR),
+                    Kind::Symlink => return Err(Errno::EINVAL),
+                    Kind::File => n < node.entry.size,
+                }
+            };
+            if shrinks && let Some(f) = self.staging_file(ino, false)? {
+                f.set_len(n).map_err(|e| {
+                    tracing::error!("truncating staging: {e}");
+                    Errno::EIO
+                })?;
+            }
+        }
+        let mut inner = self.lock();
+        let node = inner.inodes.get_mut(ino).ok_or(Errno::ENOENT)?;
+        if let Some(n) = set.size {
+            node.base_visible = node.base_visible.min(n);
+            node.entry.size = n;
+            node.dirty = true;
+            node.entry.mtime_ns = now_ns();
+        }
+        if let Some(mode) = set.mode
+            && node.kind() != Kind::Symlink
+        {
+            node.entry.mode = mode & 0o7777;
+        }
+        if let Some(t) = set.mtime_ns {
+            node.entry.mtime_ns = t;
+        }
+        if let Some(n) = set.size
+            && let Some(ext) = inner.extents.get_mut(&ino)
+        {
+            ext.retain_mut(|e| {
+                e.end = e.end.min(n);
+                e.start < e.end
+            });
+        }
+        inner.touch(ino).map_err(fail)?;
+        Ok(attr(ino, inner.inodes.get(ino).expect("live")))
+    }
+
+    /// Adds a new entry to `parent` and returns its inode (with one kernel lookup counted).
+    async fn add(&self, parent: u64, entry: DirEntry, dirty: bool) -> FsResult<u64> {
+        check_name(&entry.name)?;
+        if self.child(parent, &entry.name).await?.is_some() {
+            return Err(Errno::EEXIST);
+        }
+        let mut inner = self.lock();
+        let mut node = Node::new(parent, entry);
+        node.lookups = 1;
+        if node.kind() == Kind::File {
+            node.base_len = 0;
+            node.base_visible = 0;
+        }
+        node.dirty = dirty;
+        let ino = inner.inodes.insert(node);
+        inner.inodes.get_mut(parent).expect("parent").entry.mtime_ns = now_ns();
+        inner.touch(ino).map_err(fail)?;
+        inner.touch(parent).map_err(fail)?;
+        Ok(ino)
+    }
+
+    fn new_entry(name: &[u8], mode: u16, size: u64, content: Content) -> DirEntry {
+        DirEntry {
+            name: name.to_vec(),
+            mode,
+            mtime_ns: now_ns(),
+            size,
+            content,
+            btime_ns: None,
+            xattrs: None,
+        }
+    }
+
+    pub async fn create(&self, parent: u64, name: &[u8], mode: u16) -> FsResult<(Attr, Fh)> {
+        let _gate = self.gate.read().await;
+        self.writable()?;
+        let entry = Self::new_entry(name, mode & 0o7777, 0, Content::Inline(Vec::new()));
+        let ino = self.add(parent, entry, true).await?;
+        self.staging_file(ino, true)?;
+        let fh = self.open_file(ino, true).await?;
+        Ok((self.getattr(ino).await?, fh))
+    }
+
+    pub async fn mkdir(&self, parent: u64, name: &[u8], mode: u16) -> FsResult<Attr> {
+        let _gate = self.gate.read().await;
+        self.writable()?;
+        let entry = Self::new_entry(name, mode & 0o7777, 0, Content::Dir(self.empty_tree));
+        let ino = self.add(parent, entry, false).await?;
+        self.getattr(ino).await
+    }
+
+    pub async fn symlink(&self, parent: u64, name: &[u8], target: &[u8]) -> FsResult<Attr> {
+        let _gate = self.gate.read().await;
+        self.writable()?;
+        if target.is_empty() || target.len() > 4095 || target.contains(&0) {
+            return Err(Errno::EINVAL);
+        }
+        let entry = Self::new_entry(
+            name,
+            0o777,
+            target.len() as u64,
+            Content::Symlink(target.to_vec()),
+        );
+        let ino = self.add(parent, entry, false).await?;
+        self.getattr(ino).await
+    }
+
+    /// Removes `ino` (named `name` in `parent`) from the tree. Open files live on until
+    /// their last release.
+    fn remove_entry(
+        &self,
+        inner: &mut Inner,
+        parent: u64,
+        name: &[u8],
+        ino: u64,
+        in_base: bool,
+    ) -> FsResult<()> {
+        inner.inodes.detach(ino);
+        if in_base {
+            inner.whiteouts.insert((parent, name.to_vec()));
+        }
+        let open = inner.inodes.get(ino).is_some_and(|n| n.open > 0);
+        if inner.inodes.get(ino).is_some_and(|n| n.kind() == Kind::Dir) {
+            inner.whiteouts.retain(|(p, _)| *p != ino);
+        }
+        if open {
+            let node = inner.inodes.get_mut(ino).expect("live");
+            node.unlinked = true;
+            node.changed = false;
+        } else {
+            inner.inodes.remove(ino);
+            inner.extents.remove(&ino);
+        }
+        inner.inodes.get_mut(parent).expect("parent").entry.mtime_ns = now_ns();
+        inner
+            .db()
+            .tx(|t| {
+                db::delete_node(t, ino)?;
+                if in_base {
+                    db::add_whiteout(t, parent, name)?;
+                }
+                Ok(())
+            })
+            .map_err(fail)?;
+        inner.touch(parent).map_err(fail)?;
+        if !open {
+            self.drop_staging(ino);
+        }
+        Ok(())
+    }
+
+    pub async fn unlink(&self, parent: u64, name: &[u8]) -> FsResult<()> {
+        let _gate = self.gate.read().await;
+        self.writable()?;
+        let ino = self.child(parent, name).await?.ok_or(Errno::ENOENT)?;
+        let in_base = self.in_base(parent, name).await?;
+        let mut inner = self.lock();
+        if inner.inodes.get(ino).ok_or(Errno::ENOENT)?.kind() == Kind::Dir {
+            return Err(Errno::EISDIR);
+        }
+        self.remove_entry(&mut inner, parent, name, ino, in_base)
+    }
+
+    pub async fn rmdir(&self, parent: u64, name: &[u8]) -> FsResult<()> {
+        let _gate = self.gate.read().await;
+        self.writable()?;
+        let ino = self.child(parent, name).await?.ok_or(Errno::ENOENT)?;
+        if self.lock().inodes.get(ino).ok_or(Errno::ENOENT)?.kind() != Kind::Dir {
+            return Err(Errno::ENOTDIR);
+        }
+        if !self.listing(ino).await?.is_empty() {
+            return Err(Errno::ENOTEMPTY);
+        }
+        let in_base = self.in_base(parent, name).await?;
+        let mut inner = self.lock();
+        self.remove_entry(&mut inner, parent, name, ino, in_base)
+    }
+
+    /// `no_replace` is `RENAME_NOREPLACE`.
+    pub async fn rename(
+        &self,
+        parent: u64,
+        name: &[u8],
+        new_parent: u64,
+        new_name: &[u8],
+        no_replace: bool,
+    ) -> FsResult<()> {
+        let _gate = self.gate.read().await;
+        self.writable()?;
+        check_name(new_name)?;
+        let src = self.child(parent, name).await?.ok_or(Errno::ENOENT)?;
+        let dst = self.child(new_parent, new_name).await?;
+        if dst == Some(src) {
+            return Ok(());
+        }
+        let kind = |ino: u64| -> FsResult<Kind> {
+            Ok(self.lock().inodes.get(ino).ok_or(Errno::ENOENT)?.kind())
+        };
+        let src_dir = kind(src)? == Kind::Dir;
+        if let Some(dst) = dst {
+            if no_replace {
+                return Err(Errno::EEXIST);
+            }
+            match (src_dir, kind(dst)? == Kind::Dir) {
+                (true, false) => return Err(Errno::ENOTDIR),
+                (false, true) => return Err(Errno::EISDIR),
+                (true, true) if !self.listing(dst).await?.is_empty() => {
+                    return Err(Errno::ENOTEMPTY);
+                }
+                _ => {}
+            }
+        }
+        let src_in_base = self.in_base(parent, name).await?;
+        let dst_in_base = self.in_base(new_parent, new_name).await?;
+        let mut inner = self.lock();
+        if let Some(dst) = dst {
+            self.remove_entry(&mut inner, new_parent, new_name, dst, dst_in_base)?;
+        }
+        inner.inodes.detach(src);
+        if src_in_base {
+            inner.whiteouts.insert((parent, name.to_vec()));
+            inner
+                .db()
+                .tx(|t| db::add_whiteout(t, parent, name))
+                .map_err(fail)?;
+        }
+        inner.inodes.attach(src, new_parent, new_name.to_vec());
+        let now = now_ns();
+        inner.inodes.get_mut(parent).expect("parent").entry.mtime_ns = now;
+        inner
+            .inodes
+            .get_mut(new_parent)
+            .expect("parent")
+            .entry
+            .mtime_ns = now;
+        inner.touch(src).map_err(fail)?;
+        inner.touch(parent).map_err(fail)?;
+        inner.touch(new_parent).map_err(fail)?;
+        Ok(())
+    }
+
+    /// Makes the file's written bytes and extent map durable on this machine.
+    pub async fn fsync(&self, ino: u64) -> FsResult<()> {
+        if self.read_only {
+            return Ok(());
+        }
+        if let Some(f) = self.staging_file(ino, false)? {
+            f.sync_data().map_err(|e| {
+                tracing::error!("syncing staging: {e}");
+                Errno::EIO
+            })?;
+        }
+        self.lock().db().sync().map_err(fail)
     }
 
     pub async fn status(&self) -> Result<Status> {
-        todo!("M3: status")
+        let (base, dirty) = {
+            let inner = self.lock();
+            let changed = inner
+                .inodes
+                .iter()
+                .filter(|(_, n)| n.changed && !n.unlinked && n.kind() != Kind::Dir)
+                .count();
+            (inner.base.clone(), (changed + inner.whiteouts.len()) as u64)
+        };
+        let behind = match (&base.branch, &base.etag) {
+            (Some(b), Some(etag)) => {
+                self.repo.backend().head(&b.branch_key()).await?.as_ref() != Some(etag)
+            }
+            _ => false,
+        };
+        Ok(Status {
+            branch: base.branch,
+            base_commit: base.commit,
+            dirty_files: dirty,
+            behind,
+            auto_forked_from: base.auto_forked_from,
+            read_only: self.read_only,
+        })
     }
 
-    /// Replaces the entry at `path` with the one in `from`, and invalidates the kernel's cache of it.
+    /// Replaces the entry at `path` with the one in `from`, and invalidates the kernel's
+    /// cache of it.
     pub async fn restore(&self, path: &[u8], from: &RefSpec) -> Result<()> {
-        let _ = (path, from);
-        todo!("M3: restore")
+        let _gate = self.gate.read().await;
+        self.writable().map_err(io_errno)?;
+        let resolved = self.repo.resolve(from).await?;
+        let mut entry = self
+            .repo
+            .entry_at(resolved.root_tree, Some(path))
+            .await?
+            .ok_or_else(|| ctm_repo::Error::PathNotFound(String::from_utf8_lossy(path).into()))?;
+        let (dir, name) = match path.iter().rposition(|&b| b == b'/') {
+            Some(i) => (&path[..i], &path[i + 1..]),
+            None => (&b""[..], path),
+        };
+        let mut parent = ROOT;
+        for part in dir.split(|&b| b == b'/').filter(|p| !p.is_empty()) {
+            parent = self
+                .child(parent, part)
+                .await
+                .map_err(io_errno)?
+                .ok_or_else(|| {
+                    ctm_repo::Error::PathNotFound(String::from_utf8_lossy(dir).into())
+                })?;
+        }
+        let existing = self.child(parent, name).await.map_err(io_errno)?;
+        entry.name = name.to_vec();
+        let (ino, dropped) = {
+            let mut inner = self.lock();
+            let mut dropped = Vec::new();
+            let ino = match existing {
+                Some(ino) => {
+                    // Everything below a restored directory comes from the ref now.
+                    let mut stack = vec![ino];
+                    while let Some(d) = stack.pop() {
+                        for (_, c) in inner.inodes.children(d) {
+                            stack.push(c);
+                            dropped.push(c);
+                        }
+                        inner.whiteouts.retain(|(p, _)| *p != d);
+                    }
+                    for c in &dropped {
+                        if inner.inodes.get(*c).is_some_and(|n| n.open > 0) {
+                            inner.inodes.detach(*c);
+                            let n = inner.inodes.get_mut(*c).expect("live");
+                            n.unlinked = true;
+                            n.changed = false;
+                        } else {
+                            inner.inodes.remove(*c);
+                            inner.extents.remove(c);
+                        }
+                    }
+                    inner.extents.remove(&ino);
+                    dropped.push(ino);
+                    let node = inner.inodes.get_mut(ino).expect("live");
+                    node.base_len = entry.size;
+                    node.base_visible = entry.size;
+                    node.dirty = false;
+                    node.entry = entry;
+                    ino
+                }
+                None => inner.inodes.insert(Node::new(parent, entry)),
+            };
+            inner.db().tx(|t| {
+                for d in &dropped {
+                    db::delete_node(t, *d)?;
+                }
+                Ok(())
+            })?;
+            inner.touch(ino)?;
+            (ino, dropped)
+        };
+        for d in dropped {
+            self.drop_staging(d);
+        }
+        self.invalidate(Invalidate::Inode(ino));
+        self.invalidate(Invalidate::Entry {
+            parent,
+            name: name.to_vec(),
+        });
+        Ok(())
     }
 }
 
 /// Fetches every tree of the mounted commit in the background, breadth-first, so `find` and
 /// `stat` rarely wait on the network.
-async fn walk_metadata(fetcher: Arc<Fetcher>, root: Id) {
+async fn walk_metadata(fetcher: Arc<Fetcher>, root: Id, empty: Id) {
     let mut level = vec![root];
     while !level.is_empty() {
         let trees: Vec<Arc<Tree>> = stream::iter(level)
+            .filter(|id| std::future::ready(*id != empty))
             .map(|id| {
                 let fetcher = fetcher.clone();
                 async move { fetcher.tree(&id, true).await }
@@ -688,5 +1592,24 @@ async fn walk_metadata(fetcher: Arc<Fetcher>, root: Id) {
                 _ => None,
             })
             .collect();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_extent;
+
+    #[test]
+    fn extents_merge_where_they_touch() {
+        let mut e = Vec::new();
+        merge_extent(&mut e, 10..20);
+        merge_extent(&mut e, 30..40);
+        assert_eq!(e, [10..20, 30..40]);
+        merge_extent(&mut e, 20..25);
+        assert_eq!(e, [10..25, 30..40]);
+        merge_extent(&mut e, 5..35);
+        assert_eq!((e.len(), e[0].clone()), (1, 5..40));
+        merge_extent(&mut e, 0..1);
+        assert_eq!(e, [0..1, 5..40]);
     }
 }
