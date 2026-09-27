@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # v0 baseline benchmarks: the "before" numbers for the roadmap.
 #
-#   bench/baseline.sh [all|fork|head|seqread|append|npm|linux|linuxgit|gitremount]
+#   bench/baseline.sh [all|fork|head|seqread|append|npm|linux|linuxgit|gitremount|history|ttfb]
 #
-# BENCH_RESULTS appends to another results file (for a roadmap item's "after" run), and
-# LINUX_BRANCH imports the kernel into another branch (so a new format is measured from scratch).
+# BENCH_RESULTS appends to another results file (for a roadmap item's "after" run),
+# LINUX_BRANCH imports the kernel into another branch (so a new format is measured from scratch),
+# and BENCH_PREFIX uses another repo in the same bucket (with its own local state), for builds
+# whose formats differ.
 #
 # Needs a bucket and an env file (BENCH_ENV, default ~/.config/continuum/bench.env) setting
 # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, CTM_BENCH_URL (s3://bucket/prefix), and
@@ -27,10 +29,15 @@ set +a
 BUCKET=${CTM_BENCH_URL#s3://}
 BUCKET=${BUCKET%%/*}
 PREFIX=${CTM_BENCH_URL#s3://$BUCKET/}
+STATE=$WORK/home
+if [ -n "${BENCH_PREFIX:-}" ]; then
+  CTM_BENCH_URL=s3://$BUCKET/$BENCH_PREFIX
+  STATE=$WORK/home-$BENCH_PREFIX
+fi
 
 # Continuum's own state, isolated from the real home directory.
-export XDG_CONFIG_HOME=$WORK/home/config XDG_DATA_HOME=$WORK/home/data
-export XDG_CACHE_HOME=$WORK/home/cache XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+export XDG_CONFIG_HOME=$STATE/config XDG_DATA_HOME=$STATE/data
+export XDG_CACHE_HOME=$STATE/cache XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
 # rclone, configured from the same credentials, without a config file.
 export RCLONE_CONFIG_R2_TYPE=s3 RCLONE_CONFIG_R2_PROVIDER=Cloudflare
 export RCLONE_CONFIG_R2_ACCESS_KEY_ID=$AWS_ACCESS_KEY_ID
@@ -239,8 +246,7 @@ bench_npm() {
   unmount_all
 }
 
-# 7. Cold find over the Linux kernel source, with an empty metadata cache.
-bench_linux() {
+linux_branch() {
   local src=$WORK/linux
   if [ ! -d "$src" ]; then
     log "cloning the Linux kernel (shallow)"
@@ -254,6 +260,11 @@ bench_linux() {
     record "Import the Linux kernel tree, $(find "$src" -type f | wc -l) files; ${out#*; }" \
       "$(secs "$t0" "$EPOCHREALTIME") s"
   fi
+}
+
+# 7. Cold find over the Linux kernel source, with an empty metadata cache.
+bench_linux() {
+  linux_branch
   cold_cache
   "$CTM" mount "$LINUX_BRANCH" "$MNT" --read-only >/dev/null
   local t0=$EPOCHREALTIME
@@ -272,6 +283,41 @@ bench_linuxgit() {
   record "7. Cold \`git status\` over the kernel tree" \
     "$(secs "$t0" "$EPOCHREALTIME") s; downloaded $(mib "$(fetched)")"
   unmount_all
+}
+
+# R3. A fresh machine (empty cache and index mirror): mount the kernel tree and read the first
+# byte of a file six directories deep. Three runs.
+TTFB_FILE=drivers/gpu/drm/amd/display/dc/core/dc.c
+bench_ttfb() {
+  linux_branch
+  local runs=()
+  for i in 1 2 3; do
+    cold_cache
+    local t0=$EPOCHREALTIME
+    "$CTM" mount "$LINUX_BRANCH" "$MNT" --read-only >/dev/null
+    local t1=$EPOCHREALTIME
+    head -c 1 "$MNT/$TTFB_FILE" >/dev/null
+    local t2=$EPOCHREALTIME
+    runs+=("mount $(secs "$t0" "$t1") s + first byte $(secs "$t1" "$t2") s")
+    unmount_all
+  done
+  record "Fresh machine: mount the kernel tree, read 1 byte of $TTFB_FILE ($("$CTM" --version))" \
+    "$(IFS=';'; echo "${runs[*]}" | sed 's/;/; /g')"
+}
+
+# History for ttfb: HISTORY pushes (default 1000), each a one-file import into its own branch,
+# so the repo has that many index segments, as it would after that many commits.
+bench_history() {
+  linux_branch
+  local have dir=$STATE/history-src
+  have=$("$CTM" branch list | grep -c '^hist-' || true)
+  log "pushing $((${HISTORY:-1000} - have)) times"
+  mkdir -p "$dir"
+  for ((i = have + 1; i <= ${HISTORY:-1000}; i++)); do
+    echo "$i" >"$dir/n"
+    "$CTM" import "$dir" --branch "hist-$i" >/dev/null
+  done
+  record "History: $("$CTM" branch list | grep -c '^hist-') pushes" "done"
 }
 
 # R9. `git status` on a fresh mount of a repo whose index was last refreshed in a mount.
@@ -301,6 +347,6 @@ bench_gitremount() {
 setup
 case ${1:-all} in
   all) bench_fork; bench_head; bench_seqread; bench_append; bench_npm; bench_linux; bench_linuxgit ;;
-  fork | head | seqread | append | npm | linux | linuxgit | gitremount) "bench_$1" ;;
-  *) echo "usage: $0 [all|fork|head|seqread|append|npm|linux|linuxgit|gitremount]" >&2; exit 2 ;;
+  fork | head | seqread | append | npm | linux | linuxgit | gitremount | history | ttfb) "bench_$1" ;;
+  *) echo "usage: $0 [all|fork|head|seqread|append|npm|linux|linuxgit|gitremount|history|ttfb]" >&2; exit 2 ;;
 esac
