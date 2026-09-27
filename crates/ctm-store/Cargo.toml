@@ -11,12 +11,15 @@ publish.workspace = true
 [dependencies]
 ctm-core.workspace = true
 async-trait.workspace = true
+blake3.workspace = true
 bytes.workspace = true
+hex.workspace = true
 object_store.workspace = true
 rusqlite.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

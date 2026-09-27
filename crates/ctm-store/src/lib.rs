@@ -56,20 +56,73 @@ pub trait Backend: Send + Sync + 'static {
     async fn head(&self, key: &str) -> Result<Option<ETag>>;
     /// Returns `Error::PreconditionFailed` when the precondition in `mode` doesn't hold.
     async fn put(&self, key: &str, body: Bytes, mode: PutMode) -> Result<ETag>;
-    /// All keys under `prefix`, in lexicographic order.
+    /// All keys starting with `prefix` (a plain string prefix), in lexicographic order.
     async fn list(&self, prefix: &str) -> Result<Vec<String>>;
+    /// Removes a key; deleting a missing key is not an error.
+    async fn delete(&self, key: &str) -> Result<()>;
 }
 
 /// Opens the backend for a repo URL: `s3://bucket/prefix` (AWS S3, or any S3-compatible
 /// service when `endpoint` is set) or `file:///path`.
 pub fn open(url: &str, endpoint: Option<&str>) -> Result<Arc<dyn Backend>> {
-    let _ = (url, endpoint);
-    todo!("M1: open backend from URL")
+    let bad = || Error::BadUrl(url.to_string());
+    if let Some(path) = url.strip_prefix("file://") {
+        if !path.starts_with('/') {
+            return Err(bad());
+        }
+        return Ok(Arc::new(FileBackend::new(path)));
+    }
+    if let Some(rest) = url.strip_prefix("s3://") {
+        let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
+        if bucket.is_empty() {
+            return Err(bad());
+        }
+        return Ok(Arc::new(S3Backend::new(
+            bucket,
+            prefix.trim_matches('/'),
+            endpoint,
+        )?));
+    }
+    Err(bad())
 }
 
 /// Exercises `If-None-Match: *` and `If-Match` against the backend, and fails if either
 /// is not honored.
 pub async fn probe(backend: &dyn Backend) -> Result<()> {
-    let _ = backend;
-    todo!("M1: conditional-write probe")
+    let key = format!("probe/{}", uuid::Uuid::new_v4().simple());
+    let result = probe_key(backend, &key).await;
+    backend.delete(&key).await?;
+    result
+}
+
+async fn probe_key(backend: &dyn Backend, key: &str) -> Result<()> {
+    let refused = |what: &str| Error::ProbeFailed(format!("the backend ignores {what}"));
+    let first = backend
+        .put(key, Bytes::from_static(b"1"), PutMode::CreateOnly)
+        .await?;
+    match backend
+        .put(key, Bytes::from_static(b"2"), PutMode::CreateOnly)
+        .await
+    {
+        Err(Error::PreconditionFailed(_)) => {}
+        Ok(_) => return Err(refused("If-None-Match: *")),
+        Err(e) => return Err(e),
+    }
+    // A well-formed ETag that no object has.
+    let stale = ETag("\"ctm-probe-stale\"".to_string());
+    match backend
+        .put(key, Bytes::from_static(b"3"), PutMode::IfMatch(stale))
+        .await
+    {
+        Err(Error::PreconditionFailed(_)) => {}
+        Ok(_) => return Err(refused("If-Match")),
+        Err(e) => return Err(e),
+    }
+    backend
+        .put(key, Bytes::from_static(b"4"), PutMode::IfMatch(first))
+        .await?;
+    match backend.get(key).await?.0.as_ref() {
+        b"4" => Ok(()),
+        _ => Err(refused("If-Match")),
+    }
 }

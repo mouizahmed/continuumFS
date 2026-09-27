@@ -6,7 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 
-use crate::{Backend, ETag, PutMode, Result};
+use crate::{Backend, ETag, Error, PutMode, Result};
 
 #[derive(Clone, Debug, Default)]
 pub struct Faults {
@@ -21,14 +21,27 @@ pub struct Faults {
 
 pub struct FaultyBackend<B> {
     inner: B,
-    faults: Mutex<Faults>,
+    state: Mutex<State>,
+}
+
+struct State {
+    faults: Faults,
+    puts: usize,
+    crashed: bool,
+    rng: u64,
 }
 
 impl<B: Backend> FaultyBackend<B> {
     pub fn new(inner: B, faults: Faults) -> FaultyBackend<B> {
+        let rng = faults.seed ^ 0x9e37_79b9_7f4a_7c15;
         FaultyBackend {
             inner,
-            faults: Mutex::new(faults),
+            state: Mutex::new(State {
+                faults,
+                puts: 0,
+                crashed: false,
+                rng,
+            }),
         }
     }
 
@@ -38,30 +51,70 @@ impl<B: Backend> FaultyBackend<B> {
 
     /// Clears every fault, as if the process restarted with a healthy network.
     pub fn heal(&self) {
-        let _ = &self.faults;
-        todo!("M1: FaultyBackend::heal")
+        let mut s = self.state.lock().unwrap();
+        s.faults = Faults::default();
+        s.crashed = false;
     }
+
+    /// Runs the fault checks for one call; `put` says whether it's a write.
+    async fn before(&self, put: bool) -> Result<()> {
+        let latency = self.state.lock().unwrap().faults.latency;
+        if !latency.is_zero() {
+            tokio::time::sleep(latency).await;
+        }
+        let mut s = self.state.lock().unwrap();
+        if s.crashed {
+            return Err(injected("crashed"));
+        }
+        if put && s.faults.crash_after_puts.is_some_and(|n| s.puts >= n) {
+            s.crashed = true;
+            return Err(injected("crashed"));
+        }
+        if s.faults.error_rate > 0.0 {
+            // splitmix64
+            s.rng = s.rng.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = s.rng;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^= z >> 31;
+            if ((z >> 11) as f64 / (1u64 << 53) as f64) < s.faults.error_rate {
+                return Err(injected("error"));
+            }
+        }
+        Ok(())
+    }
+}
+
+fn injected(what: &str) -> Error {
+    Error::Backend(format!("injected {what}"))
 }
 
 #[async_trait]
 impl<B: Backend> Backend for FaultyBackend<B> {
     async fn get(&self, key: &str) -> Result<(Bytes, ETag)> {
-        let _ = key;
-        todo!("M1: FaultyBackend::get")
+        self.before(false).await?;
+        self.inner.get(key).await
     }
 
     async fn head(&self, key: &str) -> Result<Option<ETag>> {
-        let _ = key;
-        todo!("M1: FaultyBackend::head")
+        self.before(false).await?;
+        self.inner.head(key).await
     }
 
     async fn put(&self, key: &str, body: Bytes, mode: PutMode) -> Result<ETag> {
-        let _ = (key, body, mode);
-        todo!("M1: FaultyBackend::put")
+        self.before(true).await?;
+        let etag = self.inner.put(key, body, mode).await?;
+        self.state.lock().unwrap().puts += 1;
+        Ok(etag)
     }
 
     async fn list(&self, prefix: &str) -> Result<Vec<String>> {
-        let _ = prefix;
-        todo!("M1: FaultyBackend::list")
+        self.before(false).await?;
+        self.inner.list(prefix).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.before(true).await?;
+        self.inner.delete(key).await
     }
 }

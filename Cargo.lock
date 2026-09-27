@@ -438,14 +438,17 @@ name = "ctm-store"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "blake3",
  "bytes",
  "ctm-core",
+ "hex",
  "object_store",
  "rusqlite",
  "tempfile",
  "thiserror",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

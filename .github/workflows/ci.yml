@@ -8,6 +8,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
+  CTM_TEST_S3_URL: s3://ctm-test
+  CTM_TEST_S3_ENDPOINT: http://localhost:9000
+  AWS_ACCESS_KEY_ID: ctmtest
+  AWS_SECRET_ACCESS_KEY: ctmtestsecret
+  AWS_REGION: us-east-1
 
 jobs:
   check:
@@ -18,6 +23,7 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - run: docker compose up -d s3 && docker compose run --rm s3-init
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --locked
       - run: cargo test --workspace --locked

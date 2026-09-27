@@ -1,0 +1,26 @@
+# Local S3-compatible server for tests (RustFS; MinIO no longer publishes images).
+#
+#   docker compose up -d s3 && docker compose run --rm s3-init
+#   CTM_TEST_S3_URL=s3://ctm-test CTM_TEST_S3_ENDPOINT=http://localhost:9000 \
+#   AWS_ACCESS_KEY_ID=ctmtest AWS_SECRET_ACCESS_KEY=ctmtestsecret AWS_REGION=us-east-1 cargo test
+services:
+  s3:
+    image: rustfs/rustfs:1.0.0
+    ports:
+      - "9000:9000"
+    environment:
+      RUSTFS_ACCESS_KEY: ctmtest
+      RUSTFS_SECRET_KEY: ctmtestsecret
+
+  # Creates the ctm-test bucket once the server answers (409 means it already exists).
+  s3-init:
+    image: curlimages/curl:8.22.0
+    depends_on:
+      - s3
+    entrypoint:
+      - sh
+      - -c
+      - >
+        until curl -s -o /dev/null -w '%{http_code}' -X PUT
+        --aws-sigv4 aws:amz:us-east-1:s3 --user ctmtest:ctmtestsecret
+        http://s3:9000/ctm-test | grep -qE '^(200|409)$'; do sleep 1; done
