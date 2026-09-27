@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # v0 baseline benchmarks: the "before" numbers for the roadmap.
 #
-#   bench/baseline.sh [all|fork|head|seqread|append|npm|linux|gitremount]
+#   bench/baseline.sh [all|fork|head|seqread|append|npm|linux|linuxgit|gitremount]
+#
+# BENCH_RESULTS appends to another results file (for a roadmap item's "after" run), and
+# LINUX_BRANCH imports the kernel into another branch (so a new format is measured from scratch).
 #
 # Needs a bucket and an env file (BENCH_ENV, default ~/.config/continuum/bench.env) setting
 # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, CTM_BENCH_URL (s3://bucket/prefix), and
@@ -11,7 +14,8 @@ set -euo pipefail
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 WORK=${BENCH_WORK:-$ROOT/target/bench}
-RESULTS=$ROOT/bench/results/v0-baseline.md
+RESULTS=${BENCH_RESULTS:-$ROOT/bench/results/v0-baseline.md}
+LINUX_BRANCH=${LINUX_BRANCH:-linux}
 MOUNT_S3=${MOUNT_S3:-$ROOT/target/bench/tools/mount-s3/bin/mount-s3}
 NPM_APP=${NPM_APP:-https://github.com/nestjs/nest}
 NPM_APP_REF=${NPM_APP_REF:-v11.2.6}
@@ -60,9 +64,9 @@ setup() {
   if [ ! -f "$XDG_CONFIG_HOME/continuum/config.toml" ]; then
     "$CTM" init "$CTM_BENCH_URL" --endpoint "$CTM_BENCH_ENDPOINT"
   fi
-  if ! grep -q "^# v0 baseline" "$RESULTS" 2>/dev/null; then
+  if [ ! -f "$RESULTS" ]; then
     {
-      echo "# v0 baseline"
+      echo "# $(basename "$RESULTS" .md)"
       echo
       echo "Run $(date -u +%Y-%m-%d) on $(uname -srm), $(nproc) cores, against Cloudflare R2 over a home connection (about 300 Mbit/s up, 560 Mbit/s down)."
       echo
@@ -194,10 +198,9 @@ bench_append() {
 
 # 4 and 5. git clone + npm ci inside a mount vs. the local disk, then commit node_modules.
 bench_npm() {
-  if ! "$CTM" branch list | grep -qx npm; then
-    mkdir -p "$WORK/empty"
-    "$CTM" import "$WORK/empty" --branch npm >/dev/null
-  fi
+  local branch=npm-$RANDOM
+  mkdir -p "$WORK/empty"
+  "$CTM" import "$WORK/empty" --branch "$branch" >/dev/null
   export npm_config_cache=$WORK/npm-cache npm_config_audit=false npm_config_fund=false
   local local_dir=$WORK/npm-local
   rm -rf "$local_dir"
@@ -215,8 +218,7 @@ bench_npm() {
   local npm_local
   npm_local=$(secs "$t0" "$EPOCHREALTIME")
 
-  "$CTM" mount npm "$MNT" >/dev/null
-  rm -rf "${MNT:?}/app"
+  "$CTM" mount "$branch" "$MNT" >/dev/null
   t0=$EPOCHREALTIME
   git clone --quiet --depth 1 --branch "$NPM_APP_REF" "$NPM_APP" "$MNT/app"
   local clone_mnt
@@ -237,32 +239,35 @@ bench_npm() {
   unmount_all
 }
 
-# 7. Cold find and git status over the Linux kernel source, with an empty metadata cache.
+# 7. Cold find over the Linux kernel source, with an empty metadata cache.
 bench_linux() {
   local src=$WORK/linux
   if [ ! -d "$src" ]; then
     log "cloning the Linux kernel (shallow)"
     git clone --quiet --depth 1 https://github.com/torvalds/linux "$src"
   fi
-  if ! "$CTM" branch list | grep -qx linux; then
+  if ! "$CTM" branch list | grep -qx "$LINUX_BRANCH"; then
     log "importing the kernel tree"
     local t0=$EPOCHREALTIME
     local out
-    out=$("$CTM" import "$src" --branch linux)
+    out=$("$CTM" import "$src" --branch "$LINUX_BRANCH")
     record "Import the Linux kernel tree, $(find "$src" -type f | wc -l) files; ${out#*; }" \
       "$(secs "$t0" "$EPOCHREALTIME") s"
   fi
   cold_cache
-  "$CTM" mount linux "$MNT" --read-only >/dev/null
+  "$CTM" mount "$LINUX_BRANCH" "$MNT" --read-only >/dev/null
   local t0=$EPOCHREALTIME
   local n
   n=$(find "$MNT" | wc -l)
   record "7. Cold \`find\` over the kernel tree ($n entries)" "$(secs "$t0" "$EPOCHREALTIME") s"
   unmount_all
+}
 
+# 7. Cold git status over the Linux kernel source, with empty caches.
+bench_linuxgit() {
   cold_cache
-  "$CTM" mount linux "$MNT" --read-only >/dev/null
-  t0=$EPOCHREALTIME
+  "$CTM" mount "$LINUX_BRANCH" "$MNT" --read-only >/dev/null
+  local t0=$EPOCHREALTIME
   git -C "$MNT" status --porcelain >/dev/null 2>&1 || true
   record "7. Cold \`git status\` over the kernel tree" \
     "$(secs "$t0" "$EPOCHREALTIME") s; downloaded $(mib "$(fetched)")"
@@ -295,7 +300,7 @@ bench_gitremount() {
 
 setup
 case ${1:-all} in
-  all) bench_fork; bench_head; bench_seqread; bench_append; bench_npm; bench_linux ;;
-  fork | head | seqread | append | npm | linux | gitremount) "bench_$1" ;;
-  *) echo "usage: $0 [all|fork|head|seqread|append|npm|linux|gitremount]" >&2; exit 2 ;;
+  all) bench_fork; bench_head; bench_seqread; bench_append; bench_npm; bench_linux; bench_linuxgit ;;
+  fork | head | seqread | append | npm | linux | linuxgit | gitremount) "bench_$1" ;;
+  *) echo "usage: $0 [all|fork|head|seqread|append|npm|linux|linuxgit|gitremount]" >&2; exit 2 ;;
 esac

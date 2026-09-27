@@ -178,11 +178,19 @@ Published as measured, wins and losses; details and a reading of each number are
 Sequential throughput, small-file commits, and `git status` on a fresh mount are v0's weak spots;
 they're what the next versions work on.
 
-**Since v0.1** (unreleased, on `main`): inode numbers are stable file IDs stored in the repo, so a
-git index written in one mount stays valid in the next. `git status` on a fresh mount of
-git/git (4,852 files) went from 242 s to 4.7 s, and from 50 MiB to 2.7 MiB downloaded
-([details](bench/results/r9-stable-inodes.md)). Repos written by v0.1 are still read, and are
-upgraded to format version 2 on their first write, after which v0.1 refuses them.
+**Since v0.1** (unreleased, on `main`):
+
+- Inode numbers are stable file IDs stored in the repo, so a git index written in one mount
+  stays valid in the next. `git status` on a fresh mount of git/git (4,852 files) went from
+  242 s to 4.7 s, and from 50 MiB to 2.7 MiB downloaded
+  ([details](bench/results/r9-stable-inodes.md)).
+- Objects are written into 32 MiB packs with a lazily synced index, instead of one bucket object
+  per file. Committing a clone plus `node_modules` (60k files) went from 110 s and 15,949 PUTs to
+  15 s and 13 PUTs; importing the Linux kernel tree from 550 s to 47 s
+  ([details](bench/results/r1-packs.md)).
+
+Repos written by v0.1 are still read, and are upgraded to format version 2 on their first write,
+after which v0.1 refuses them.
 
 ## Development
 
