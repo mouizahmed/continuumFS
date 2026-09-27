@@ -178,6 +178,12 @@ Published as measured, wins and losses; details and a reading of each number are
 Sequential throughput, small-file commits, and `git status` on a fresh mount are v0's weak spots;
 they're what the next versions work on.
 
+**Since v0.1** (unreleased, on `main`): inode numbers are stable file IDs stored in the repo, so a
+git index written in one mount stays valid in the next. `git status` on a fresh mount of
+git/git (4,852 files) went from 242 s to 4.7 s, and from 50 MiB to 2.7 MiB downloaded
+([details](bench/results/r9-stable-inodes.md)). Repos written by v0.1 are still read, and are
+upgraded to format version 2 on their first write, after which v0.1 refuses them.
+
 ## Development
 
 ```sh

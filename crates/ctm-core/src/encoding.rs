@@ -6,8 +6,8 @@
 use crate::id::{Id, RepoKey};
 use crate::layout::PAGE_MAX;
 use crate::object::{
-    Chunk, ChunkList, ChunkPage, ChunkRef, Commit, CommitKind, Content, DirEntry, FormatParams,
-    Kind, LogEntry, LogSegment, ObjectType, PageRef, Tree, Xattr,
+    Chunk, ChunkList, ChunkPage, ChunkRef, Commit, CommitKind, Content, DirEntry, FILE_ID_END,
+    FILE_ID_MIN, FormatParams, Kind, LogEntry, LogSegment, ObjectType, PageRef, Tree, Xattr,
 };
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -31,6 +31,7 @@ pub enum DecodeError {
 
 /// An object type with a canonical encoding.
 pub trait Object: Sized {
+    /// The type written.
     const TYPE: ObjectType;
 
     /// The payload bytes (without the `[type][flags]` framing).
@@ -38,6 +39,21 @@ pub trait Object: Sized {
 
     /// Parses a payload, rejecting anything that isn't the canonical encoding of a valid value.
     fn decode(payload: &[u8], params: &FormatParams) -> Result<Self, DecodeError>;
+
+    /// The types read: `TYPE`, plus older types that decode into the same value.
+    fn reads(ty: ObjectType) -> bool {
+        ty == Self::TYPE
+    }
+
+    /// Parses a payload stored as `ty` (one of the types [`Object::reads`] accepts).
+    fn decode_as(
+        ty: ObjectType,
+        payload: &[u8],
+        params: &FormatParams,
+    ) -> Result<Self, DecodeError> {
+        let _ = ty;
+        Self::decode(payload, params)
+    }
 }
 
 /// An encoded object ready to store: its ID and payload.
@@ -68,23 +84,23 @@ impl Encoded {
     }
 }
 
-/// Splits a stored object into its type and payload, checking the type and that `flags == 0`.
-pub fn unframe(stored: &[u8], expected: ObjectType) -> Result<&[u8], DecodeError> {
+/// Splits a stored object into its type and payload, checking that `T` reads the type and
+/// that `flags == 0`.
+pub fn unframe<T: Object>(stored: &[u8]) -> Result<(ObjectType, &[u8]), DecodeError> {
     let [ty, flags, payload @ ..] = stored else {
         return Err(DecodeError::Truncated);
     };
-    if *ty != expected as u8 {
+    let found = ObjectType::from_u8(*ty);
+    let Some(ty) = found.filter(|t| T::reads(*t)) else {
         return Err(DecodeError::WrongType {
-            expected,
-            found: ObjectType::from_u8(*ty),
+            expected: T::TYPE,
+            found,
         });
-    }
+    };
     if *flags != 0 {
-        return Err(DecodeError::Invalid(
-            "flags (must be 0 in format version 1)",
-        ));
+        return Err(DecodeError::Invalid("flags (must be 0)"));
     }
-    Ok(payload)
+    Ok((ty, payload))
 }
 
 /// Decodes a stored object and checks that it hashes to `id`.
@@ -94,15 +110,15 @@ pub fn decode_verified<T: Object>(
     stored: &[u8],
     params: &FormatParams,
 ) -> Result<T, VerifyError> {
-    let payload = unframe(stored, T::TYPE)?;
-    let actual = Id::compute(key, T::TYPE, payload);
+    let (ty, payload) = unframe::<T>(stored)?;
+    let actual = Id::compute(key, ty, payload);
     if actual != *id {
         return Err(VerifyError::HashMismatch {
             expected: *id,
             actual,
         });
     }
-    Ok(T::decode(payload, params)?)
+    Ok(T::decode_as(ty, payload, params)?)
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -351,7 +367,7 @@ impl Object for ChunkList {
     }
 }
 
-fn encode_entry(w: &mut Writer, e: &DirEntry) {
+fn encode_entry(w: &mut Writer, e: &DirEntry, with_file_id: bool) {
     w.bytes8(&e.name);
     w.u8(e.content.kind() as u8);
     w.u16(e.mode);
@@ -387,13 +403,20 @@ fn encode_entry(w: &mut Writer, e: &DirEntry) {
             w.bytes32(&x.value);
         }
     });
+    if with_file_id {
+        w.u64(e.file_id.expect("every entry of a Tree has a file ID"));
+    }
 }
 
 fn valid_name(n: &[u8]) -> bool {
     !n.is_empty() && n != b"." && n != b".." && !n.iter().any(|&b| b == b'/' || b == 0)
 }
 
-fn decode_entry(r: &mut Reader<'_>, params: &FormatParams) -> Result<DirEntry, DecodeError> {
+fn decode_entry(
+    r: &mut Reader<'_>,
+    params: &FormatParams,
+    with_file_id: bool,
+) -> Result<DirEntry, DecodeError> {
     let name = r.bytes8()?;
     check(valid_name(name), "entry name")?;
     let kind = match r.u8()? {
@@ -471,6 +494,13 @@ fn decode_entry(r: &mut Reader<'_>, params: &FormatParams) -> Result<DirEntry, D
         }
         Ok(xs)
     })?;
+    let file_id = if with_file_id {
+        let id = r.u64()?;
+        check((FILE_ID_MIN..FILE_ID_END).contains(&id), "file ID")?;
+        Some(id)
+    } else {
+        None
+    };
     Ok(DirEntry {
         name: name.to_vec(),
         mode,
@@ -479,7 +509,19 @@ fn decode_entry(r: &mut Reader<'_>, params: &FormatParams) -> Result<DirEntry, D
         content,
         btime_ns,
         xattrs,
+        file_id,
     })
+}
+
+/// The payload of a [`ObjectType::LegacyTree`] (format version 1), for tests of upgrading.
+#[doc(hidden)]
+pub fn encode_legacy_tree(tree: &Tree) -> Vec<u8> {
+    let mut w = Writer(Vec::new());
+    w.u32(tree.entries.len() as u32);
+    for e in &tree.entries {
+        encode_entry(&mut w, e, false);
+    }
+    w.0
 }
 
 impl Object for Tree {
@@ -489,18 +531,31 @@ impl Object for Tree {
         let mut w = Writer(Vec::new());
         w.u32(self.entries.len() as u32);
         for e in &self.entries {
-            encode_entry(&mut w, e);
+            encode_entry(&mut w, e, true);
         }
         w.0
     }
 
     fn decode(payload: &[u8], params: &FormatParams) -> Result<Self, DecodeError> {
+        Self::decode_as(ObjectType::Tree, payload, params)
+    }
+
+    fn reads(ty: ObjectType) -> bool {
+        matches!(ty, ObjectType::Tree | ObjectType::LegacyTree)
+    }
+
+    fn decode_as(
+        ty: ObjectType,
+        payload: &[u8],
+        params: &FormatParams,
+    ) -> Result<Self, DecodeError> {
+        let with_file_id = ty == ObjectType::Tree;
         decode_with(payload, |r| {
             let count = r.u32()? as usize;
             // An entry is at least 32 bytes; don't trust the count for the allocation.
             let mut entries: Vec<DirEntry> = Vec::with_capacity(count.min(r.buf.len() / 32));
             for _ in 0..count {
-                let e = decode_entry(r, params)?;
+                let e = decode_entry(r, params, with_file_id)?;
                 if entries.last().is_some_and(|last| last.name >= e.name) {
                     return Err(DecodeError::Unsorted);
                 }

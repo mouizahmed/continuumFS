@@ -45,6 +45,10 @@ pub(crate) struct Prepared {
     dirty: Vec<u64>,
     /// New trees for changed directories, by inode.
     dirs: HashMap<u64, Id>,
+    /// File IDs given to changed entries that had none (from format-1 trees), by inode.
+    new_ids: HashMap<u64, u64>,
+    /// File IDs given to unchanged entries of rewritten format-1 trees: (dir, name, id).
+    base_ids: Vec<(u64, Vec<u8>, u64)>,
     /// The ref being written, and where.
     new_ref: BranchRef,
     target: BranchName,
@@ -57,6 +61,10 @@ struct Built {
     files: HashMap<u64, DirEntry>,
     dirty: Vec<u64>,
     dirs: HashMap<u64, Id>,
+    /// File IDs given to changed entries that had none (from format-1 trees), by inode.
+    new_ids: HashMap<u64, u64>,
+    /// File IDs given to unchanged entries of rewritten format-1 trees: (dir, name, id).
+    base_ids: Vec<(u64, Vec<u8>, u64)>,
 }
 
 /// A changed node, as of the start of the commit.
@@ -250,6 +258,8 @@ impl MountState {
         if !snap.nodes.contains_key(&ROOT) {
             return Ok(CommitOutcome::NothingToCommit);
         }
+        // Trees are written in the current format; older clients must refuse the repo first.
+        self.repo.upgrade_format().await?;
         let base = snap.base.clone();
         let branch = base
             .branch
@@ -261,6 +271,8 @@ impl MountState {
             files: HashMap::new(),
             dirty: Vec::new(),
             dirs: HashMap::new(),
+            new_ids: HashMap::new(),
+            base_ids: Vec::new(),
             new_ref: base
                 .branch_ref
                 .clone()
@@ -275,6 +287,8 @@ impl MountState {
         prepared.files = built.files;
         prepared.dirty = built.dirty;
         prepared.dirs = built.dirs;
+        prepared.new_ids = built.new_ids;
+        prepared.base_ids = built.base_ids;
         let identity = self.repo.identity();
         let commit = Commit {
             root_tree: prepared.root,
@@ -396,6 +410,21 @@ impl MountState {
                     n.entry.content = Content::Dir(*tree);
                 }
             }
+            // Entries that just got file IDs keep the inode numbers the kernel knows them by
+            // until they're next looked up fresh; the IDs are what later mounts will use.
+            for (ino, id) in &p.new_ids {
+                if let Some(n) = inner.inodes.get_mut(*ino) {
+                    n.entry.file_id = Some(*id);
+                }
+            }
+            for (dir, name, id) in &p.base_ids {
+                if let Some(ino) = inner.inodes.child(*dir, name)
+                    && let Some(n) = inner.inodes.get_mut(ino)
+                    && n.entry.file_id.is_none()
+                {
+                    n.entry.file_id = Some(*id);
+                }
+            }
             let mut orphans = HashSet::new();
             for (ino, n) in inner.inodes.iter_mut() {
                 if n.unlinked {
@@ -479,12 +508,24 @@ impl MountState {
             unreachable!("directories hold a tree");
         };
         let base = self.tree(base_tree).await.map_err(errno)?;
-        let mut entries: BTreeMap<Vec<u8>, DirEntry> = base
-            .entries
-            .iter()
-            .filter(|e| !snap.whiteouts.contains(&(dir, e.name.clone())))
-            .map(|e| (e.name.clone(), e.clone()))
-            .collect();
+        let mut entries: BTreeMap<Vec<u8>, DirEntry> = BTreeMap::new();
+        for e in &base.entries {
+            if snap.whiteouts.contains(&(dir, e.name.clone())) {
+                continue;
+            }
+            let mut e = e.clone();
+            if e.file_id.is_none() {
+                // An unchanged entry of a format-1 tree: it gets its file ID now.
+                let id = ctm_repo::new_file_id();
+                e.file_id = Some(id);
+                built
+                    .lock()
+                    .unwrap()
+                    .base_ids
+                    .push((dir, e.name.clone(), id));
+            }
+            entries.insert(e.name.clone(), e);
+        }
         let children = snap
             .children
             .get(&dir)
@@ -493,7 +534,7 @@ impl MountState {
         let changed: Vec<(Vec<u8>, DirEntry)> = futures::stream::iter(children)
             .map(|(name, child)| async move {
                 let c = &snap.nodes[child];
-                let entry = match c.entry.content.kind() {
+                let mut entry = match c.entry.content.kind() {
                     Kind::Dir => {
                         let tree = Box::pin(self.build_tree(snap, *child, built, slots)).await?;
                         DirEntry {
@@ -510,6 +551,11 @@ impl MountState {
                     }
                     _ => c.entry.clone(),
                 };
+                if entry.file_id.is_none() {
+                    let id = ctm_repo::new_file_id();
+                    entry.file_id = Some(id);
+                    built.lock().unwrap().new_ids.insert(*child, id);
+                }
                 if entry.content.kind() != Kind::Dir {
                     built.lock().unwrap().files.insert(*child, entry.clone());
                 }
@@ -634,6 +680,7 @@ impl MountState {
             content,
             btime_ns: None,
             xattrs: None,
+            file_id: c.entry.file_id,
         })
     }
 }

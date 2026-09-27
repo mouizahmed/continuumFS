@@ -705,3 +705,67 @@ fn appending_to_a_large_file_downloads_at_most_one_chunk() {
     data.push(b'!');
     assert!(env.run(&["cat", "main:big.bin"]).stdout == data);
 }
+
+/// R9: a git index written in one mount stays valid in the next, so `git status` on a fresh
+/// mount doesn't re-read the files.
+#[test]
+fn git_status_on_a_fresh_mount_reads_no_files() {
+    if !fuse_available() {
+        return;
+    }
+    if !Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        eprintln!("skipped: needs git");
+        return;
+    }
+    let env = Env::new();
+    env.init();
+    fs::create_dir(env.work.join("src")).unwrap();
+    env.ok(&["import", &env.path("src"), "--branch", "main"]);
+    let mnt = env.work.join("mnt");
+    fs::create_dir(&mnt).unwrap();
+    env.ok(&["mount", "main", &env.path("mnt")]);
+    let repo = mnt.join("repo");
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    fs::create_dir(&repo).unwrap();
+    git(&["init", "--quiet"]);
+    for i in 0..60 {
+        // Over 4 KiB each, so they're chunks: re-reading them would show up as downloads.
+        fs::write(repo.join(format!("f{i}.bin")), random_bytes(i, 10_000)).unwrap();
+    }
+    // Let a second pass so no file is "racily clean" (modified in the index's second).
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    git(&["add", "."]);
+    git(&["commit", "--quiet", "-m", "files"]);
+    assert_eq!(git(&["status", "--porcelain"]), "");
+    env.ok(&["unmount", &env.path("mnt")]);
+
+    fs::remove_dir_all(env.home.join(".cache")).unwrap();
+    env.ok(&["mount", "main", &env.path("mnt")]);
+    assert_eq!(git(&["status", "--porcelain"]), "", "the tree is clean");
+    let fetched = cache(&env)["fetched_bytes"].as_u64().unwrap();
+    assert!(
+        fetched < 200_000,
+        "git status downloaded {fetched} bytes: it re-read the files"
+    );
+    env.ok(&["unmount", &env.path("mnt")]);
+}

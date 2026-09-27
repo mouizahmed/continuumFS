@@ -604,3 +604,166 @@ async fn an_unknown_commit_outcome_blocks_writes_until_the_next_commit() {
         );
     }
 }
+
+// R9: stable inode numbers.
+
+fn file_id_range(ino: u64) -> bool {
+    (ctm_core::FILE_ID_MIN..ctm_core::FILE_ID_END).contains(&ino)
+}
+
+/// A fresh mount of the same branch, in a new directory with its own working state.
+async fn fresh(repo: &Arc<Repo>) -> (tempfile::TempDir, MountState) {
+    let dir = tempfile::tempdir().unwrap();
+    let state = open(repo, dir.path(), "main", false).await;
+    (dir, state)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inode_numbers_are_file_ids_and_survive_remounts_and_renames() {
+    let repo = repo_with(
+        Arc::new(MemBackend::new()),
+        &[("a.txt", b"a".to_vec()), ("dir/b.txt", b"b".to_vec())],
+    )
+    .await;
+    let (_d1, one) = fresh(&repo).await;
+    let a = lookup_path(&one, "a.txt").await.unwrap();
+    let dir = lookup_path(&one, "dir").await.unwrap();
+    assert!(file_id_range(a) && file_id_range(dir), "{a} {dir}");
+    let listed: Vec<u64> = one
+        .readdir(1)
+        .await
+        .unwrap()
+        .iter()
+        .map(|i| i.ino)
+        .collect();
+    assert!(
+        listed.contains(&a),
+        "readdir reports the same number as lookup"
+    );
+
+    // New entries get file IDs at once; renames and commits keep them.
+    let new = write_file(&one, "new.txt", b"new").await;
+    assert!(file_id_range(new));
+    one.rename(1, b"a.txt", dir, b"moved.txt", false)
+        .await
+        .unwrap();
+    assert_eq!(lookup_path(&one, "dir/moved.txt").await.unwrap(), a);
+    one.commit("r9").await.unwrap();
+    drop(one);
+
+    let (_d2, two) = fresh(&repo).await;
+    assert_eq!(lookup_path(&two, "dir/moved.txt").await.unwrap(), a);
+    assert_eq!(lookup_path(&two, "new.txt").await.unwrap(), new);
+    assert_eq!(lookup_path(&two, "dir").await.unwrap(), dir);
+    // Editing a file keeps its number too.
+    write_file(&two, "new.txt", b"edited").await;
+    two.commit("edit").await.unwrap();
+    drop(two);
+    let (_d3, three) = fresh(&repo).await;
+    assert_eq!(lookup_path(&three, "new.txt").await.unwrap(), new);
+}
+
+/// A branch written by format version 1 has no file IDs: its entries get per-mount numbers
+/// until a commit rewrites their directory, and from then on keep one number everywhere.
+#[tokio::test(flavor = "multi_thread")]
+async fn format_1_entries_get_file_ids_when_their_directory_is_committed() {
+    use ctm_core::encoding::encode_legacy_tree;
+    use ctm_core::{
+        Commit, CommitKind, Content, DirEntry, Encoded, Id, LogEntry, LogSegment, ObjectType, Tree,
+    };
+    let be: Arc<dyn Backend> = Arc::new(MemBackend::new());
+    let (repo, _) = Repo::init(be.clone(), identity("laptop")).await.unwrap();
+    let mut config = serde_json::to_value(repo.config()).unwrap();
+    config["format_version"] = 1.into();
+    be.put(
+        "config",
+        serde_json::to_vec(&config).unwrap().into(),
+        ctm_store::PutMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    let repo = Arc::new(Repo::open(be.clone(), identity("laptop")).await.unwrap());
+    let old = |name: &str| DirEntry {
+        name: name.as_bytes().to_vec(),
+        mode: 0o644,
+        mtime_ns: 1,
+        size: 3,
+        content: Content::Inline(b"old".to_vec()),
+        btime_ns: None,
+        xattrs: None,
+        file_id: None,
+    };
+    let payload = encode_legacy_tree(&Tree {
+        entries: vec![old("keep.txt"), old("touch.txt")],
+    });
+    let tree_id = Id::compute(repo.key(), ObjectType::LegacyTree, &payload);
+    let mut stored = vec![ObjectType::LegacyTree as u8, 0];
+    stored.extend_from_slice(&payload);
+    be.put(
+        &format!("meta/{tree_id}"),
+        stored.into(),
+        ctm_store::PutMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    let commit = Encoded::new(
+        repo.key(),
+        &Commit {
+            root_tree: tree_id,
+            time_ns: 1,
+            author: "me@old".into(),
+            machine_id: [0; 16],
+            kind: CommitKind::Import,
+            message: String::new(),
+        },
+    );
+    let log = Encoded::new(
+        repo.key(),
+        &LogSegment {
+            prev: None,
+            entries: vec![LogEntry {
+                time_ns: 1,
+                commit: commit.id,
+                kind: CommitKind::Import,
+                message: String::new(),
+            }],
+        },
+    );
+    let (head, log_id) = (commit.id, log.id);
+    repo.put_objects(vec![commit, log]).await.unwrap();
+    repo.create_ref(
+        &main_branch(),
+        &ctm_repo::BranchRef {
+            head,
+            log: log_id,
+            forked_from: None,
+            updated_at: "2026-09-27T00:00:00Z".into(),
+            updated_by: "me".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let (_d1, one) = fresh(&repo).await;
+    let keep = lookup_path(&one, "keep.txt").await.unwrap();
+    assert!(
+        keep < ctm_core::FILE_ID_MIN,
+        "format-1 entries get per-mount numbers"
+    );
+    write_file(&one, "touch.txt", b"new").await;
+    one.commit("first v2 commit").await.unwrap();
+    assert_eq!(repo.format_version(), 2);
+    // The kernel keeps the number it knows until the entry is looked up fresh.
+    assert_eq!(lookup_path(&one, "keep.txt").await.unwrap(), keep);
+    drop(one);
+
+    let (_d2, two) = fresh(&repo).await;
+    let keep2 = lookup_path(&two, "keep.txt").await.unwrap();
+    let touch2 = lookup_path(&two, "touch.txt").await.unwrap();
+    assert!(file_id_range(keep2) && file_id_range(touch2));
+    drop(two);
+    let (_d3, three) = fresh(&repo).await;
+    assert_eq!(lookup_path(&three, "keep.txt").await.unwrap(), keep2);
+    assert_eq!(lookup_path(&three, "touch.txt").await.unwrap(), touch2);
+    assert_eq!(read_all(&three, touch2).await, b"new");
+}

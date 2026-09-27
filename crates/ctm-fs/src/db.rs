@@ -66,13 +66,21 @@ impl WorkDb {
                  ino INTEGER PRIMARY KEY, parent INTEGER NOT NULL, name BLOB NOT NULL,
                  mode INTEGER NOT NULL, mtime INTEGER NOT NULL, size INTEGER NOT NULL,
                  content_tag INTEGER NOT NULL, content BLOB NOT NULL,
-                 base_len INTEGER NOT NULL, base_visible INTEGER NOT NULL, dirty INTEGER NOT NULL);
+                 base_len INTEGER NOT NULL, base_visible INTEGER NOT NULL, dirty INTEGER NOT NULL,
+                 file_id INTEGER);
              CREATE TABLE IF NOT EXISTS whiteouts (
                  parent INTEGER NOT NULL, name BLOB NOT NULL, PRIMARY KEY (parent, name));
              CREATE TABLE IF NOT EXISTS extents (
                  ino INTEGER NOT NULL, start INTEGER NOT NULL, end INTEGER NOT NULL,
                  PRIMARY KEY (ino, start));",
         )?;
+        // Working state written by v0.1 has no file_id column.
+        let has_file_id: bool = conn
+            .prepare("SELECT 1 FROM pragma_table_info('inodes') WHERE name = 'file_id'")?
+            .exists([])?;
+        if !has_file_id {
+            conn.execute_batch("ALTER TABLE inodes ADD COLUMN file_id INTEGER")?;
+        }
         Ok(WorkDb { conn })
     }
 
@@ -118,7 +126,7 @@ impl WorkDb {
         let mut rows = Vec::new();
         let mut stmt = self.conn.prepare(
             "SELECT ino, parent, name, mode, mtime, size, content_tag, content,
-                    base_len, base_visible, dirty FROM inodes",
+                    base_len, base_visible, dirty, file_id FROM inodes",
         )?;
         let mut q = stmt.query([])?;
         while let Some(r) = q.next()? {
@@ -135,6 +143,7 @@ impl WorkDb {
                 content,
                 btime_ns: None,
                 xattrs: None,
+                file_id: r.get::<_, Option<i64>>(11)?.map(|v| v as u64),
             };
             let mut node = Node::new(r.get::<_, i64>(1)? as u64, entry);
             node.base_len = r.get::<_, i64>(8)? as u64;
@@ -185,8 +194,8 @@ pub fn save_node(t: &Transaction<'_>, ino: u64, n: &Node) -> Result<()> {
     let (tag, bytes) = content_parts(&n.entry.content);
     t.execute(
         "INSERT OR REPLACE INTO inodes (ino, parent, name, mode, mtime, size, content_tag,
-             content, base_len, base_visible, dirty)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             content, base_len, base_visible, dirty, file_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             ino as i64,
             n.parent as i64,
@@ -199,6 +208,7 @@ pub fn save_node(t: &Transaction<'_>, ino: u64, n: &Node) -> Result<()> {
             n.base_len as i64,
             n.base_visible as i64,
             i64::from(n.dirty),
+            n.entry.file_id.map(|v| v as i64),
         ],
     )?;
     Ok(())

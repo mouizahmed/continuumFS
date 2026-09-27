@@ -2,8 +2,8 @@
 
 use ctm_core::{
     Chunk, ChunkList, ChunkPage, ChunkRef, Commit, CommitKind, Content, DecodeError, DirEntry,
-    Encoded, FormatParams, Id, LogEntry, LogSegment, Object, ObjectType, PageRef, RepoKey, Tree,
-    Xattr,
+    Encoded, FILE_ID_END, FILE_ID_MIN, FormatParams, Id, LogEntry, LogSegment, Object, ObjectType,
+    PageRef, RepoKey, Tree, Xattr,
 };
 use proptest::collection::{btree_map, vec};
 use proptest::prelude::*;
@@ -70,6 +70,7 @@ fn entry(name: Vec<u8>, (content, size): (Content, u64), mode: u16, mtime_ns: i6
         content,
         btime_ns: None,
         xattrs: None,
+        file_id: Some(FILE_ID_MIN + mtime_ns.unsigned_abs() % 1000),
     }
 }
 
@@ -80,12 +81,16 @@ fn arb_entry_for(name: Vec<u8>) -> impl Strategy<Value = DirEntry> {
         any::<i64>(),
         proptest::option::of(any::<i64>()),
         arb_xattrs(),
+        FILE_ID_MIN..FILE_ID_END,
     )
-        .prop_map(move |(c, mode, mtime, btime_ns, xattrs)| DirEntry {
-            btime_ns,
-            xattrs,
-            ..entry(name.clone(), c, mode, mtime)
-        })
+        .prop_map(
+            move |(c, mode, mtime, btime_ns, xattrs, file_id)| DirEntry {
+                btime_ns,
+                xattrs,
+                file_id: Some(file_id),
+                ..entry(name.clone(), c, mode, mtime)
+            },
+        )
 }
 
 fn arb_tree() -> impl Strategy<Value = Tree> {
@@ -396,4 +401,55 @@ fn pinned_vectors() {
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+#[test]
+fn file_ids_must_be_in_range() {
+    for bad in [0, 1, FILE_ID_MIN - 1, FILE_ID_END, u64::MAX] {
+        let t = Tree {
+            entries: vec![DirEntry {
+                file_id: Some(bad),
+                ..file("a", b"x")
+            }],
+        };
+        assert!(Tree::decode(&t.encode(), &P).is_err(), "{bad} accepted");
+    }
+}
+
+/// Format version 1 wrote directories as `LegacyTree` (0x04), without file IDs. These are the
+/// exact bytes of v0.1's pinned tree vector; they must stay readable.
+#[test]
+fn legacy_trees_still_decode() {
+    use ctm_core::encoding::{decode_verified, encode_legacy_tree};
+    let key = RepoKey([0x42; 32]);
+    let payload = hex_decode(
+        "0300000005612e74787401a40100002a36fe9c97170200000000000000010200686900000364697202ed01
+         050000000000000000000000000000000404040404040404040404040404040404040404040404040404
+         040404040404040000046c696e6b03ff0106000000000000000500000000000000050500612e74787400
+         00",
+    );
+    let id: Id = "059608421b892b1dfde5c363b3dbedc3cb4775db41a895dffc6bb302b9b39c28"
+        .parse()
+        .unwrap();
+    let mut stored = vec![ObjectType::LegacyTree as u8, 0];
+    stored.extend_from_slice(&payload);
+    let tree = decode_verified::<Tree>(&key, &id, &stored, &P).unwrap();
+    let names: Vec<_> = tree.entries.iter().map(|e| e.name.clone()).collect();
+    assert_eq!(
+        names,
+        [b"a.txt".to_vec(), b"dir".to_vec(), b"link".to_vec()]
+    );
+    assert!(tree.entries.iter().all(|e| e.file_id.is_none()));
+    // Re-encoding it the old way gives the same bytes back.
+    assert_eq!(encode_legacy_tree(&tree), payload);
+    // Read as a new Tree, it's too short: every entry lacks its file ID.
+    assert!(Tree::decode(&payload, &P).is_err());
+}
+
+fn hex_decode(s: &str) -> Vec<u8> {
+    let s: String = s.split_whitespace().collect();
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
 }

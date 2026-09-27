@@ -1,9 +1,12 @@
 //! The in-memory inode table.
 //!
-//! Numbers are assigned on first lookup and never reused within a mount process, so the
-//! FUSE generation is always 0. Changed entries (and their ancestors) stay in memory for the
-//! life of the mount; a clean entry is dropped when the kernel forgets it and no handle has it
-//! open. The root is always inode 1.
+//! An entry's inode number is its file ID, the same in every mount and on every machine, so
+//! tools that record inode numbers (git's index) stay valid. An entry without one (from a
+//! format-1 tree), or whose file ID is already in use by another live entry, gets a number of
+//! this mount's own, below 2³² and never reused within the mount process. Either way the FUSE
+//! generation is always 0. Changed entries (and their ancestors) stay in memory for the life of
+//! the mount; a clean entry is dropped when the kernel forgets it and no handle has it open.
+//! The root is always inode 1.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -77,7 +80,9 @@ impl Inodes {
                 root.changed = true;
                 continue;
             }
-            self.next = self.next.max(ino + 1);
+            if ino < ctm_core::FILE_ID_MIN {
+                self.next = self.next.max(ino + 1);
+            }
             self.children
                 .entry(node.parent)
                 .or_default()
@@ -114,10 +119,21 @@ impl Inodes {
             .unwrap_or_default()
     }
 
+    /// The number for a new node: its file ID if that's free, else one of this mount's own.
+    fn number(&mut self, entry: &DirEntry) -> u64 {
+        match entry.file_id {
+            Some(id) if !self.nodes.contains_key(&id) => id,
+            _ => {
+                let ino = self.next;
+                self.next += 1;
+                ino
+            }
+        }
+    }
+
     /// Adds a node under its parent and returns its new number.
     pub fn insert(&mut self, node: Node) -> u64 {
-        let ino = self.next;
-        self.next += 1;
+        let ino = self.number(&node.entry);
         self.children
             .entry(node.parent)
             .or_default()

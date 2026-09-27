@@ -450,6 +450,7 @@ impl MountState {
             content: Content::Dir(base.root),
             btime_ns: None,
             xattrs: None,
+            file_id: None,
         };
         let mut inodes = Inodes::new(root);
         let live: HashSet<u64> = rows.iter().map(|(i, _)| *i).collect();
@@ -699,7 +700,11 @@ impl MountState {
                     name,
                 }),
                 Listed::Base(e) => Some(DirItem {
-                    ino: synthetic_ino(ino, &name),
+                    // What a lookup will return, when the entry has a file ID.
+                    ino: e
+                        .file_id
+                        .filter(|id| inner.inodes.get(*id).is_none())
+                        .unwrap_or_else(|| synthetic_ino(ino, &name)),
                     kind: e.content.kind().into(),
                     name,
                 }),
@@ -1274,6 +1279,7 @@ impl MountState {
             content,
             btime_ns: None,
             xattrs: None,
+            file_id: Some(ctm_repo::new_file_id()),
         }
     }
 

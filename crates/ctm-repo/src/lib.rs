@@ -12,7 +12,9 @@ pub use check::check;
 pub use config::RepoConfig;
 pub use refs::{BranchName, BranchRef, ForkedFrom, SnapshotRef};
 pub use refspec::RefSpec;
-pub use repo::{Identity, Imported, InitOutcome, PathChange, Repo, Resolved, Uploaded, object_key};
+pub use repo::{
+    Identity, Imported, InitOutcome, PathChange, Repo, Resolved, Uploaded, new_file_id, object_key,
+};
 pub use time::rfc3339;
 
 #[derive(Debug, thiserror::Error)]
@@ -26,7 +28,7 @@ pub enum Error {
     },
     #[error("corrupt {what}: {detail}")]
     CorruptJson { what: String, detail: String },
-    #[error("repo format_version {0} is newer than this ctm supports (1)")]
+    #[error("repo format_version {0} is newer than this ctm supports ({max})", max = config::FORMAT_VERSION)]
     UnsupportedFormat(u32),
     #[error("invalid name {0:?}: use 1–100 characters from [A-Za-z0-9._-]")]
     InvalidName(String),

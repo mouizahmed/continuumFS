@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # v0 baseline benchmarks: the "before" numbers for the roadmap.
 #
-#   bench/baseline.sh [all|fork|head|seqread|append|npm|linux]
+#   bench/baseline.sh [all|fork|head|seqread|append|npm|linux|gitremount]
 #
 # Needs a bucket and an env file (BENCH_ENV, default ~/.config/continuum/bench.env) setting
 # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, CTM_BENCH_URL (s3://bucket/prefix), and
@@ -35,7 +35,8 @@ export RCLONE_CONFIG_R2_ENDPOINT=$CTM_BENCH_ENDPOINT RCLONE_CONFIG_R2_REGION=$AW
 # The token is scoped to one bucket, so rclone mustn't try to create it.
 export RCLONE_S3_NO_CHECK_BUCKET=true
 
-CTM=$ROOT/target/release/ctm
+# CTM_BIN runs another build (for example an installed release) instead of this checkout.
+CTM=${CTM_BIN:-$ROOT/target/release/ctm}
 MNT=$WORK/mnt
 mkdir -p "$WORK" "$MNT" "$(dirname "$RESULTS")"
 
@@ -53,7 +54,9 @@ unmount_all() {
 trap unmount_all EXIT
 
 setup() {
-  cargo build --release -q -p ctm --manifest-path "$ROOT/Cargo.toml"
+  if [ -z "${CTM_BIN:-}" ]; then
+    cargo build --release -q -p ctm --manifest-path "$ROOT/Cargo.toml"
+  fi
   if [ ! -f "$XDG_CONFIG_HOME/continuum/config.toml" ]; then
     "$CTM" init "$CTM_BENCH_URL" --endpoint "$CTM_BENCH_ENDPOINT"
   fi
@@ -266,9 +269,33 @@ bench_linux() {
   unmount_all
 }
 
+# R9. `git status` on a fresh mount of a repo whose index was last refreshed in a mount.
+GIT_REPO=${GIT_REPO:-https://github.com/git/git}
+bench_gitremount() {
+  local branch
+  branch="gitremount-$("$CTM" --version | tr -cd '0-9')-$RANDOM"
+  mkdir -p "$WORK/empty"
+  "$CTM" import "$WORK/empty" --branch "$branch" >/dev/null
+  "$CTM" mount "$branch" "$MNT" >/dev/null
+  git clone --quiet --depth 1 "$GIT_REPO" "$MNT/repo"
+  git -C "$MNT/repo" status --porcelain >/dev/null
+  local files
+  files=$(git -C "$MNT/repo" ls-files | wc -l)
+  "$CTM" unmount "$MNT" >/dev/null
+  cold_cache
+  "$CTM" mount "$branch" "$MNT" >/dev/null
+  local t0=$EPOCHREALTIME
+  git -C "$MNT/repo" status --porcelain >/dev/null
+  local took
+  took=$(secs "$t0" "$EPOCHREALTIME")
+  printf '| %s (%s files) | %s | %s s | %s |\n' "${GIT_REPO#https://github.com/}" "$files" \
+    "$("$CTM" --version)" "$took" "$(mib "$(fetched)")" | tee -a "$ROOT/bench/results/r9-stable-inodes.md"
+  unmount_all
+}
+
 setup
 case ${1:-all} in
   all) bench_fork; bench_head; bench_seqread; bench_append; bench_npm; bench_linux ;;
-  fork | head | seqread | append | npm | linux) "bench_$1" ;;
-  *) echo "usage: $0 [all|fork|head|seqread|append|npm|linux]" >&2; exit 2 ;;
+  fork | head | seqread | append | npm | linux | gitremount) "bench_$1" ;;
+  *) echo "usage: $0 [all|fork|head|seqread|append|npm|linux|gitremount]" >&2; exit 2 ;;
 esac

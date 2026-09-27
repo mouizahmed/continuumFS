@@ -4,7 +4,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -21,6 +21,7 @@ use ctm_core::{
 };
 use ctm_store::{Backend, ETag, PutMode};
 
+use crate::config::FORMAT_VERSION;
 use crate::refs::{BranchName, BranchRef, ForkedFrom, SnapshotRef};
 use crate::refspec::{RefSpec, RefTarget};
 use crate::time::{now_ns, rfc3339};
@@ -118,6 +119,7 @@ pub struct Repo {
     key: RepoKey,
     params: FormatParams,
     identity: Identity,
+    format_version: AtomicU32,
     /// Objects known to be stored, so uploads skip them without a HEAD.
     known: Mutex<HashSet<Id>>,
     /// Uploads in flight: a second upload of the same object waits for the first.
@@ -183,10 +185,45 @@ impl Repo {
         Repo::new(backend, config, identity)
     }
 
+    /// The format version of the repo's `config` as far as this handle knows.
+    pub fn format_version(&self) -> u32 {
+        self.format_version.load(Ordering::Relaxed)
+    }
+
+    /// Raises an older repo's `config` to the current format version (a CAS), so older clients
+    /// refuse the repo instead of failing on objects they can't decode. Call before writing a
+    /// `Tree`.
+    pub async fn upgrade_format(&self) -> Result<()> {
+        if self.format_version() >= FORMAT_VERSION {
+            return Ok(());
+        }
+        loop {
+            let (bytes, etag) = self.backend.get("config").await?;
+            let mut config = RepoConfig::parse(&bytes)?;
+            if config.format_version >= FORMAT_VERSION {
+                break;
+            }
+            config.format_version = FORMAT_VERSION;
+            let body = serde_json::to_vec_pretty(&config).expect("config serializes");
+            match self
+                .backend
+                .put("config", body.into(), PutMode::IfMatch(etag))
+                .await
+            {
+                Ok(_) => break,
+                Err(ctm_store::Error::PreconditionFailed(_)) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        self.format_version.store(FORMAT_VERSION, Ordering::Relaxed);
+        Ok(())
+    }
+
     fn new(backend: Arc<dyn Backend>, config: RepoConfig, identity: Identity) -> Result<Repo> {
         Ok(Repo {
             key: config.key()?,
             params: config.params(),
+            format_version: AtomicU32::new(config.format_version),
             config,
             backend,
             identity,
@@ -442,6 +479,7 @@ impl Repo {
             content: Content::Dir(root),
             btime_ns: None,
             xattrs: None,
+            file_id: None,
         };
         for part in path.unwrap_or_default().split(|&b| b == b'/') {
             if part.is_empty() {
@@ -686,10 +724,17 @@ impl Repo {
 
     /// Commits a local directory to a branch (created if missing, CAS otherwise).
     pub async fn import(&self, dir: &Path, branch: &BranchName, message: &str) -> Result<Imported> {
+        self.upgrade_format().await?;
         let before = self.uploaded();
         let skipped = AtomicUsize::new(0);
         let slots = tokio::sync::Semaphore::new(IMPORT_FILES);
-        let root = self.import_dir(dir, &skipped, &slots).await?;
+        // Entries at the same path as on the branch keep their file IDs.
+        let base = match self.read_ref(branch).await {
+            Ok((r, _)) => Some(self.get::<Commit>(&r.head).await?.root_tree),
+            Err(Error::UnknownRef(_)) => None,
+            Err(e) => return Err(e),
+        };
+        let root = self.import_dir(dir, base, &skipped, &slots).await?;
         let skipped = skipped.into_inner();
         let commit = Commit {
             root_tree: root,
@@ -731,13 +776,27 @@ impl Repo {
     async fn import_dir(
         &self,
         dir: &Path,
+        base: Option<Id>,
         skipped: &AtomicUsize,
         slots: &tokio::sync::Semaphore,
     ) -> Result<Id> {
         let mut children: Vec<_> = fs::read_dir(dir)?.collect::<io::Result<_>>()?;
         children.sort_by(|a, b| a.file_name().as_bytes().cmp(b.file_name().as_bytes()));
+        let base: HashMap<Vec<u8>, DirEntry> = match base {
+            Some(t) => self
+                .get::<Tree>(&t)
+                .await?
+                .entries
+                .into_iter()
+                .map(|e| (e.name.clone(), e))
+                .collect(),
+            None => HashMap::new(),
+        };
         let entries: Vec<Option<DirEntry>> = stream::iter(children)
-            .map(|child| self.import_entry(child, skipped, slots))
+            .map(|child| {
+                let old = base.get(child.file_name().as_bytes()).cloned();
+                self.import_entry(child, old, skipped, slots)
+            })
             .buffered(IMPORT_FILES)
             .try_collect()
             .await?;
@@ -750,6 +809,7 @@ impl Repo {
     async fn import_entry(
         &self,
         child: fs::DirEntry,
+        old: Option<DirEntry>,
         skipped: &AtomicUsize,
         slots: &tokio::sync::Semaphore,
     ) -> Result<Option<DirEntry>> {
@@ -768,7 +828,11 @@ impl Repo {
             let size = target.len() as u64;
             (Content::Symlink(target), size, 0o777)
         } else if ft.is_dir() {
-            let tree = Box::pin(self.import_dir(&path, skipped, slots)).await?;
+            let old_tree = match old.as_ref().map(|e| &e.content) {
+                Some(Content::Dir(t)) => Some(*t),
+                _ => None,
+            };
+            let tree = Box::pin(self.import_dir(&path, old_tree, skipped, slots)).await?;
             (Content::Dir(tree), 0, perm(&meta))
         } else if ft.is_file() {
             let _slot = slots.acquire().await.expect("never closed");
@@ -782,6 +846,11 @@ impl Repo {
             skipped.fetch_add(1, Ordering::Relaxed);
             return Ok(None);
         };
+        // Same path and kind as on the branch: the same file, so the same ID.
+        let file_id = old
+            .filter(|o| o.content.kind() == content.kind())
+            .and_then(|o| o.file_id)
+            .unwrap_or_else(new_file_id);
         Ok(Some(DirEntry {
             name: child.file_name().as_bytes().to_vec(),
             mode,
@@ -790,6 +859,7 @@ impl Repo {
             content,
             btime_ns: None,
             xattrs: None,
+            file_id: Some(file_id),
         }))
     }
 
@@ -965,6 +1035,11 @@ impl Repo {
             ))),
         }
     }
+}
+
+/// A new random file ID ([`ctm_core::FILE_ID_MIN`] and up).
+pub fn new_file_id() -> u64 {
+    ctm_core::file_id_from(getrandom::u64().expect("the OS random source works"))
 }
 
 fn perm(meta: &fs::Metadata) -> u16 {

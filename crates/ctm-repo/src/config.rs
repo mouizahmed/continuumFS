@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use ctm_core::{ChunkerParams, FormatParams, RepoKey};
 
-pub const FORMAT_VERSION: u32 = 1;
+/// Written by this version; older versions are read, and upgraded on the first write.
+pub const FORMAT_VERSION: u32 = 2;
 const ALGORITHM: &str = "fastcdc-v2020";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

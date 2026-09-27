@@ -15,6 +15,7 @@ pub use chunker::ChunkerParams;
 pub use encoding::{DecodeError, Encoded, Object};
 pub use id::{Id, RepoKey};
 pub use object::{
-    Chunk, ChunkList, ChunkPage, ChunkRef, Commit, CommitKind, Content, DirEntry, FormatParams,
-    Kind, LogEntry, LogSegment, ObjectType, PageRef, Tree, Xattr,
+    Chunk, ChunkList, ChunkPage, ChunkRef, Commit, CommitKind, Content, DirEntry, FILE_ID_END,
+    FILE_ID_MIN, FormatParams, Kind, LogEntry, LogSegment, ObjectType, PageRef, Tree, Xattr,
+    file_id_from,
 };

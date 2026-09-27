@@ -187,7 +187,7 @@ async fn refuses_newer_format() {
     let be: Arc<dyn Backend> = Arc::new(MemBackend::new());
     let repo = repo_on(be.clone()).await;
     let mut config = serde_json::to_value(repo.config()).unwrap();
-    config["format_version"] = 2.into();
+    config["format_version"] = 3.into();
     be.put(
         "config",
         serde_json::to_vec(&config).unwrap().into(),
@@ -197,7 +197,7 @@ async fn refuses_newer_format() {
     .unwrap();
     assert!(matches!(
         Repo::open(be, identity()).await,
-        Err(Error::UnsupportedFormat(2))
+        Err(Error::UnsupportedFormat(3))
     ));
 }
 
@@ -624,4 +624,137 @@ async fn futures_len(be: &MemBackend, prefix: &str) -> u64 {
         total += be.get(&key).await.unwrap().0.len() as u64;
     }
     total
+}
+
+/// Every entry `import` writes has a file ID, in range and distinct.
+#[tokio::test]
+async fn import_gives_every_entry_a_file_id() {
+    let src = tempfile::tempdir().unwrap();
+    sample_tree(src.path());
+    let repo = repo_on(Arc::new(MemBackend::new())).await;
+    let commit = repo
+        .import(src.path(), &name("main"), "")
+        .await
+        .unwrap()
+        .commit;
+    let root = repo
+        .get::<ctm_core::Commit>(&commit)
+        .await
+        .unwrap()
+        .root_tree;
+    let mut ids = std::collections::HashSet::new();
+    let mut stack = vec![root];
+    while let Some(t) = stack.pop() {
+        for e in repo.get::<ctm_core::Tree>(&t).await.unwrap().entries {
+            let id = e.file_id.expect("imported entries have file IDs");
+            assert!((ctm_core::FILE_ID_MIN..ctm_core::FILE_ID_END).contains(&id));
+            assert!(ids.insert(id), "duplicate file ID");
+            if let ctm_core::Content::Dir(d) = e.content {
+                stack.push(d);
+            }
+        }
+    }
+    assert!(ids.len() > 10);
+}
+
+/// A repo written by format version 1 (v0.1) is still readable, and the first write raises
+/// its config to version 2.
+#[tokio::test]
+async fn a_version_1_repo_is_read_and_upgraded_on_first_write() {
+    use ctm_core::encoding::encode_legacy_tree;
+    use ctm_core::{Commit, Content, DirEntry, LogEntry, LogSegment, ObjectType, Tree};
+    let be: Arc<dyn Backend> = Arc::new(MemBackend::new());
+    let repo = repo_on(be.clone()).await;
+    // Hand-build what v0.1 wrote: a version-1 config, a LegacyTree, a commit, a log, a ref.
+    let mut config = serde_json::to_value(repo.config()).unwrap();
+    config["format_version"] = 1.into();
+    be.put(
+        "config",
+        serde_json::to_vec(&config).unwrap().into(),
+        PutMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    let repo = Repo::open(be.clone(), identity()).await.unwrap();
+    assert_eq!(repo.format_version(), 1);
+    let tree = Tree {
+        entries: vec![DirEntry {
+            name: b"old.txt".to_vec(),
+            mode: 0o644,
+            mtime_ns: 1,
+            size: 3,
+            content: Content::Inline(b"old".to_vec()),
+            btime_ns: None,
+            xattrs: None,
+            file_id: None,
+        }],
+    };
+    let payload = encode_legacy_tree(&tree);
+    let tree_id = Id::compute(repo.key(), ObjectType::LegacyTree, &payload);
+    let mut stored = vec![ObjectType::LegacyTree as u8, 0];
+    stored.extend_from_slice(&payload);
+    be.put(
+        &format!("meta/{tree_id}"),
+        stored.into(),
+        PutMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    let commit = Commit {
+        root_tree: tree_id,
+        time_ns: 1,
+        author: "me@old".into(),
+        machine_id: [0; 16],
+        kind: CommitKind::Import,
+        message: "v0.1".into(),
+    };
+    let commit_enc = ctm_core::Encoded::new(repo.key(), &commit);
+    let log = LogSegment {
+        prev: None,
+        entries: vec![LogEntry {
+            time_ns: 1,
+            commit: commit_enc.id,
+            kind: CommitKind::Import,
+            message: "v0.1".into(),
+        }],
+    };
+    let log_enc = ctm_core::Encoded::new(repo.key(), &log);
+    let (head, log_id) = (commit_enc.id, log_enc.id);
+    repo.put_objects(vec![commit_enc, log_enc]).await.unwrap();
+    repo.create_ref(
+        &name("main"),
+        &ctm_repo::BranchRef {
+            head,
+            log: log_id,
+            forked_from: None,
+            updated_at: "2026-09-27T00:00:00Z".into(),
+            updated_by: "me".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    // Readable as is.
+    let dst = tempfile::tempdir().unwrap();
+    repo.export(&spec("main"), &dst.path().join("v1"))
+        .await
+        .unwrap();
+    assert_eq!(fs::read(dst.path().join("v1/old.txt")).unwrap(), b"old");
+
+    // The first write upgrades the config; old and new data stay readable.
+    import_files(&repo, "main", &[("new.txt", "new")], "v0.2").await;
+    assert_eq!(repo.format_version(), 2);
+    let reopened = Repo::open(be.clone(), identity()).await.unwrap();
+    assert_eq!(reopened.config().format_version, 2);
+    let log = reopened.log(&spec("main"), None).await.unwrap();
+    let first = log.last().unwrap().commit.to_hex();
+    reopened
+        .export(&spec(&first), &dst.path().join("again"))
+        .await
+        .unwrap();
+    assert_eq!(fs::read(dst.path().join("again/old.txt")).unwrap(), b"old");
+    assert_eq!(
+        ctm_repo::check(&reopened).await.unwrap(),
+        Vec::<String>::new()
+    );
 }

@@ -242,6 +242,7 @@ fn arb_small_tree() -> impl Strategy<Value = Tree> {
                 },
                 btime_ns: None,
                 xattrs: None,
+                file_id: Some(ctm_core::FILE_ID_MIN),
             })
             .collect(),
     })

@@ -9,9 +9,12 @@ pub enum ObjectType {
     Chunk = 0x01,
     ChunkPage = 0x02,
     ChunkList = 0x03,
-    Tree = 0x04,
+    /// A directory as written by format version 1, without file IDs. Read, never written.
+    LegacyTree = 0x04,
     Commit = 0x05,
     LogSegment = 0x06,
+    /// A directory whose entries all have file IDs.
+    Tree = 0x07,
 }
 
 impl ObjectType {
@@ -20,9 +23,10 @@ impl ObjectType {
             0x01 => ObjectType::Chunk,
             0x02 => ObjectType::ChunkPage,
             0x03 => ObjectType::ChunkList,
-            0x04 => ObjectType::Tree,
+            0x04 => ObjectType::LegacyTree,
             0x05 => ObjectType::Commit,
             0x06 => ObjectType::LogSegment,
+            0x07 => ObjectType::Tree,
             _ => return None,
         })
     }
@@ -96,6 +100,19 @@ pub struct DirEntry {
     pub btime_ns: Option<i64>,
     /// Reserved for macOS xattrs; always `None` on Linux.
     pub xattrs: Option<Vec<Xattr>>,
+    /// Stable across edits, renames, commits, and mounts; reported as the inode number.
+    /// `None` only for entries read from a [`ObjectType::LegacyTree`].
+    pub file_id: Option<u64>,
+}
+
+/// File IDs fall in `[FILE_ID_MIN, FILE_ID_END)`: above a mount's own inode numbers, and
+/// below `readdir`'s synthetic ones.
+pub const FILE_ID_MIN: u64 = 1 << 32;
+pub const FILE_ID_END: u64 = 1 << 63;
+
+/// A file ID from 64 random bits.
+pub fn file_id_from(random: u64) -> u64 {
+    FILE_ID_MIN + random % (FILE_ID_END - FILE_ID_MIN)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
