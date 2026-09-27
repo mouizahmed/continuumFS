@@ -101,7 +101,8 @@ pub struct Repo {
     known: Mutex<HashSet<Id>>,
 }
 
-fn object_key(ty: ObjectType, id: &Id) -> String {
+/// Where an object is stored: `chunks/<id>` for chunks, `meta/<id>` for everything else.
+pub fn object_key(ty: ObjectType, id: &Id) -> String {
     let dir = if ty.is_data() { "chunks" } else { "meta" };
     format!("{dir}/{id}")
 }

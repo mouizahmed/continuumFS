@@ -12,9 +12,12 @@ publish.workspace = true
 ctm-core.workspace = true
 ctm-store.workspace = true
 ctm-repo.workspace = true
+blake3.workspace = true
 fuser.workspace = true
+futures.workspace = true
 libc.workspace = true
 rusqlite.workspace = true
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -22,6 +25,8 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
+bytes.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 

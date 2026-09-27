@@ -5,10 +5,8 @@ use clap::{Parser, Subcommand};
 
 mod commands;
 mod config;
-// Used by the mount commands as they land (M2–M3).
-#[allow(dead_code)]
 mod control;
-#[allow(dead_code)]
+mod mount;
 mod paths;
 
 #[derive(Parser)]
@@ -174,10 +172,15 @@ async fn run(command: Command) -> Result<()> {
         Command::Snapshot(SnapshotCommand::List) => commands::snapshot_list().await,
         Command::Log { spec, path } => commands::log(&spec, path.as_deref()).await,
         Command::Diff { a, b, stat } => commands::diff(&a, &b, stat).await,
-        Command::Mount { .. } => todo!("M2: ctm mount"),
-        Command::MountProcess { .. } => todo!("M2: mount process"),
-        Command::Cache(CacheCommand::Stats { .. }) => todo!("M2: ctm cache stats"),
-        Command::Unmount { .. } => todo!("M3: ctm unmount"),
+        Command::Mount {
+            spec,
+            dir,
+            read_only,
+            foreground,
+        } => mount::mount(&spec, &dir, read_only, foreground).await,
+        Command::MountProcess { state_dir } => mount::run(state_dir).await,
+        Command::Cache(CacheCommand::Stats { json }) => mount::cache_stats(json).await,
+        Command::Unmount { dir, no_commit } => mount::unmount(&dir, no_commit).await,
         Command::Commit { .. } => todo!("M3: ctm commit"),
         Command::Status { .. } => todo!("M3: ctm status"),
         Command::Restore { .. } => todo!("M3: ctm restore"),

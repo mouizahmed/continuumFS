@@ -402,13 +402,18 @@ dependencies = [
 name = "ctm-fs"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
+ "blake3",
+ "bytes",
  "ctm-core",
  "ctm-repo",
  "ctm-store",
  "fuser",
+ "futures",
  "libc",
  "proptest",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

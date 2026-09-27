@@ -1,78 +1,10 @@
 //! The `ctm` binary end to end, with its own HOME and XDG directories.
 
+mod common;
+
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
 
-struct Env {
-    _tmp: tempfile::TempDir,
-    home: PathBuf,
-    repo_url: String,
-    work: PathBuf,
-}
-
-impl Env {
-    fn new() -> Env {
-        let tmp = tempfile::tempdir().unwrap();
-        let home = tmp.path().join("home");
-        let work = tmp.path().join("work");
-        fs::create_dir_all(&home).unwrap();
-        fs::create_dir_all(&work).unwrap();
-        let repo_url = format!("file://{}", tmp.path().join("bucket/ws").display());
-        Env {
-            home,
-            repo_url,
-            work,
-            _tmp: tmp,
-        }
-    }
-
-    fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_ctm"))
-            .args(args)
-            .current_dir(&self.work)
-            .env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap())
-            .env("HOME", &self.home)
-            .env("USER", "tester")
-            .env("XDG_CONFIG_HOME", self.home.join(".config"))
-            .env("XDG_CACHE_HOME", self.home.join(".cache"))
-            .env("XDG_DATA_HOME", self.home.join(".local/share"))
-            .env("XDG_RUNTIME_DIR", self.home.join("run"))
-            .output()
-            .unwrap()
-    }
-
-    /// Runs a command that must succeed and returns its stdout.
-    fn ok(&self, args: &[&str]) -> String {
-        let out = self.run(args);
-        assert!(
-            out.status.success(),
-            "ctm {args:?} failed:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8(out.stdout).unwrap()
-    }
-
-    /// Runs a command that must fail and returns its stderr.
-    fn fails(&self, args: &[&str]) -> String {
-        let out = self.run(args);
-        assert!(!out.status.success(), "ctm {args:?} succeeded");
-        let err = String::from_utf8(out.stderr).unwrap();
-        assert!(!err.contains("panicked"), "ctm {args:?} panicked:\n{err}");
-        err
-    }
-
-    fn path(&self, rel: &str) -> String {
-        self.work.join(rel).display().to_string()
-    }
-}
-
-fn write(root: &Path, rel: &str, data: &str) {
-    let p = root.join(rel);
-    fs::create_dir_all(p.parent().unwrap()).unwrap();
-    fs::write(p, data).unwrap();
-}
+use common::{Env, write};
 
 #[test]
 fn init_creates_then_connects_and_records_the_default_repo() {

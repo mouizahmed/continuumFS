@@ -12,11 +12,11 @@ use crate::Result;
 use crate::config::LocalConfig;
 use crate::paths;
 
-fn load_config() -> Result<LocalConfig> {
+pub(crate) fn load_config() -> Result<LocalConfig> {
     Ok(LocalConfig::load_or_create(&paths::config_file())?)
 }
 
-fn identity(config: &LocalConfig) -> Result<Identity> {
+pub(crate) fn identity(config: &LocalConfig) -> Result<Identity> {
     let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
         .or_else(|_| std::fs::read_to_string("/etc/hostname"))
         .map(|h| h.trim().to_string())

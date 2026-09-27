@@ -3,7 +3,9 @@
 //! [`MountState`] holds all filesystem logic and is tested directly, without FUSE.
 //! [`fuse`] adapts it to the kernel.
 
+mod fetch;
 pub mod fuse;
+mod inode;
 mod state;
 
 pub use state::{
@@ -25,6 +27,7 @@ impl Errno {
     pub const EIO: Errno = Errno(libc::EIO);
     pub const ENOTSUP: Errno = Errno(libc::ENOTSUP);
     pub const ENAMETOOLONG: Errno = Errno(libc::ENAMETOOLONG);
+    pub const EINVAL: Errno = Errno(libc::EINVAL);
 }
 
 pub type FsResult<T> = std::result::Result<T, Errno>;
@@ -33,6 +36,10 @@ pub type FsResult<T> = std::result::Result<T, Errno>;
 pub enum Error {
     #[error(transparent)]
     Repo(#[from] ctm_repo::Error),
+    #[error(transparent)]
+    Store(#[from] ctm_store::Error),
+    #[error("mounting a path inside a ref isn't supported; mount the ref itself")]
+    PathInRef,
     #[error("{0} has uncommitted changes for branch {1}; mount that branch to commit them")]
     StateForOtherBranch(String, String),
     #[error(transparent)]
