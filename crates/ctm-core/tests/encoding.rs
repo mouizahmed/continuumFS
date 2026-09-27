@@ -15,11 +15,18 @@ fn arb_id() -> impl Strategy<Value = Id> {
 }
 
 fn arb_name() -> impl Strategy<Value = Vec<u8>> {
-    vec(
-        any::<u8>().prop_filter("no / or NUL", |b| *b != b'/' && *b != 0),
-        1..=40,
-    )
-    .prop_filter("not . or ..", |n| n != b"." && n != b"..")
+    // Map bytes instead of filtering, so long runs never hit proptest's reject limit.
+    vec(1u8..=254, 1..=40).prop_map(|mut n| {
+        for b in &mut n {
+            if *b >= b'/' {
+                *b += 1; // skip '/'
+            }
+        }
+        if n == b"." || n == b".." {
+            n = b"x".to_vec();
+        }
+        n
+    })
 }
 
 fn arb_content() -> impl Strategy<Value = (Content, u64)> {
@@ -165,34 +172,27 @@ fn round_trip<T: Object + PartialEq + std::fmt::Debug>(obj: &T) {
 
 proptest! {
     #[test]
-    #[ignore = "M1"]
     fn tree_round_trips(t in arb_tree()) { round_trip(&t); }
 
     #[test]
-    #[ignore = "M1"]
     fn chunk_page_round_trips(p in arb_page()) { round_trip(&p); }
 
     #[test]
-    #[ignore = "M1"]
     fn chunk_list_round_trips(l in arb_list()) { round_trip(&l); }
 
     #[test]
-    #[ignore = "M1"]
     fn commit_round_trips(c in arb_commit()) { round_trip(&c); }
 
     #[test]
-    #[ignore = "M1"]
     fn log_segment_round_trips(s in arb_log()) { round_trip(&s); }
 
     #[test]
-    #[ignore = "M1"]
     fn chunk_round_trips(b in vec(any::<u8>(), 1..10_000)) {
         let c = Chunk(b);
         assert_eq!(Chunk::decode(&c.encode(), &P).unwrap(), c);
     }
 
     #[test]
-    #[ignore = "M1"]
     fn encoding_is_deterministic(t in arb_tree()) {
         assert_eq!(t.encode(), t.clone().encode());
     }
@@ -208,7 +208,6 @@ fn file(name: &str, data: &[u8]) -> DirEntry {
 }
 
 #[test]
-#[ignore = "M1"]
 fn unsorted_or_duplicate_entries_are_rejected() {
     let mut unsorted = Tree {
         entries: vec![file("b", b"1"), file("a", b"2")],
@@ -223,7 +222,6 @@ fn unsorted_or_duplicate_entries_are_rejected() {
 }
 
 #[test]
-#[ignore = "M1"]
 fn invalid_names_are_rejected() {
     for name in [&b"."[..], b"..", b"a/b", b"a\0b", b""] {
         let bytes = Tree {
@@ -238,7 +236,6 @@ fn invalid_names_are_rejected() {
 }
 
 #[test]
-#[ignore = "M1"]
 fn kind_must_match_content() {
     // Tree: count u32, then the entry: name_len u8, name, kind u8, …
     let mut bytes = Tree {
@@ -252,7 +249,6 @@ fn kind_must_match_content() {
 }
 
 #[test]
-#[ignore = "M1"]
 fn inline_size_and_chunk_size_limits() {
     let big_inline = Tree {
         entries: vec![file("f", &[7u8; 4097])],
@@ -272,7 +268,6 @@ fn inline_size_and_chunk_size_limits() {
 }
 
 #[test]
-#[ignore = "M1"]
 fn ids_are_keyed_and_typed() {
     let a = RepoKey([1; 32]);
     let b = RepoKey([2; 32]);
@@ -288,7 +283,6 @@ fn ids_are_keyed_and_typed() {
 }
 
 #[test]
-#[ignore = "M1"]
 fn verified_decode_catches_corruption() {
     use ctm_core::encoding::{VerifyError, decode_verified};
     let key = RepoKey([9; 32]);
@@ -311,7 +305,6 @@ fn verified_decode_catches_corruption() {
 
 /// One fixed example of every type, so an accidental encoding change shows up as a diff.
 #[test]
-#[ignore = "M1"]
 fn pinned_vectors() {
     let key = RepoKey([0x42; 32]);
     let id = |b: u8| Id([b; 32]);

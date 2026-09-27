@@ -14,8 +14,10 @@ pub struct RepoKey(pub [u8; 32]);
 impl Id {
     /// The ID of an object with this type and (uncompressed, unencrypted) payload.
     pub fn compute(key: &RepoKey, ty: ObjectType, payload: &[u8]) -> Id {
-        let _ = (key, ty, payload);
-        todo!("M1: keyed BLAKE3 object IDs")
+        let mut h = blake3::Hasher::new_keyed(&key.0);
+        h.update(&[ty as u8]);
+        h.update(payload);
+        Id(*h.finalize().as_bytes())
     }
 
     pub fn to_hex(&self) -> String {

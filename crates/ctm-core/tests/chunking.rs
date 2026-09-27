@@ -28,7 +28,6 @@ fn random_bytes(seed: u64, len: usize) -> Vec<u8> {
 
 proptest! {
     #[test]
-    #[ignore = "M1"]
     fn chunks_cover_the_input_within_bounds(seed: u64, len in 0usize..50_000) {
         let data = random_bytes(seed, len);
         let lens = chunk_all(&SMALL, &data);
@@ -44,7 +43,6 @@ proptest! {
 
     /// Feeding the cutter windows of any size gives the same cuts as chunking at once.
     #[test]
-    #[ignore = "M1"]
     fn streaming_cuts_match(seed: u64, len in 0usize..30_000, window in 1usize..3000) {
         let data = random_bytes(seed, len);
         let mut lens = Vec::new();
@@ -145,11 +143,8 @@ fn expand(segments: &[Segment], base: &[u32]) -> Vec<u32> {
 }
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(512))]
-
     /// The core promise of partial writes: the result equals a full re-chunk.
     #[test]
-    #[ignore = "M1"]
     fn partial_rechunk_equals_full_rechunk(
         seed: u64,
         base_len in 0usize..40_000,
@@ -181,7 +176,6 @@ proptest! {
 }
 
 #[test]
-#[ignore = "M1"]
 fn append_reads_only_the_tail() {
     let base = random_bytes(7, 200_000);
     let base_lens = chunk_all(&SMALL, &base);
@@ -212,7 +206,6 @@ fn append_reads_only_the_tail() {
 }
 
 #[test]
-#[ignore = "M1"]
 fn pages_are_full_except_the_last() {
     for n in [0usize, 1, 4095, 4096, 4097, 8192, 10_000] {
         let chunks: Vec<ChunkRef> = (0..n)
@@ -256,7 +249,6 @@ fn arb_small_tree() -> impl Strategy<Value = Tree> {
 
 proptest! {
     #[test]
-    #[ignore = "M1"]
     fn diff_matches_brute_force(old in arb_small_tree(), new in arb_small_tree()) {
         let a: BTreeMap<_, _> = old.entries.iter().map(|e| (e.name.clone(), e.clone())).collect();
         let b: BTreeMap<_, _> = new.entries.iter().map(|e| (e.name.clone(), e.clone())).collect();
@@ -273,5 +265,57 @@ proptest! {
             })
             .collect();
         prop_assert_eq!(diff_trees(&old, &new), expected);
+    }
+}
+
+/// The same promise with the real chunk sizes (256 KiB / 1 MiB / 4 MiB): edit the middle,
+/// append, and truncate a 24 MiB file.
+#[test]
+fn partial_rechunk_with_default_params() {
+    let p = ChunkerParams::DEFAULT;
+    let base = random_bytes(42, 24 << 20);
+    let base_lens = chunk_all(&p, &base);
+    assert!(base_lens.len() > 8);
+    for edits in [
+        vec![Edit::Write {
+            at: 10 << 20,
+            len: 100,
+            seed: 1,
+        }],
+        vec![Edit::Write {
+            at: base.len(),
+            len: 1,
+            seed: 2,
+        }],
+        vec![Edit::Truncate((24 << 20) - 1)],
+        vec![
+            Edit::Write {
+                at: 1 << 20,
+                len: 5000,
+                seed: 3,
+            },
+            Edit::Write {
+                at: 20 << 20,
+                len: 1,
+                seed: 4,
+            },
+        ],
+    ] {
+        let (merged, changes) = apply(&base, &edits);
+        let mut reader = Reader {
+            data: &merged,
+            bytes_read: 0,
+        };
+        let segments = rechunk_partial(&p, &base_lens, &changes, &mut reader).unwrap();
+        assert_eq!(
+            expand(&segments, &base_lens),
+            chunk_all(&p, &merged),
+            "{edits:?}"
+        );
+        assert!(
+            reader.bytes_read < 16 << 20,
+            "{edits:?} read {} bytes",
+            reader.bytes_read
+        );
     }
 }

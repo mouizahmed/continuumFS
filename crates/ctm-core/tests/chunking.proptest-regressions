@@ -8,3 +8,5 @@ cc 1b51caef2f6c79d246dabf189745932824c98c34c2017f7d8a9bbcc3aafe048e # shrinks to
 cc ddba2f4c5832f2d8a6e6676b6587faa8f905d80ba27d6572e838c0c16e54ca1d # shrinks to old = Tree { entries: [] }, new = Tree { entries: [] }
 cc 6ecaec8b99d333e6d46c0f481d2700c7820281c48e75f405c2167115a1fa4e5a # shrinks to seed = 0, base_len = 0, edits = []
 cc 7aeb34e3f4fda666ebc11f9ffadc7abd6376ec6a0b2cb49ec8be728ebdff9664 # shrinks to seed = 0, len = 0
+cc 96c86cab082c47b603c589837642b0a62861a836027fb7f1b13e0b62141afa03 # shrinks to seed = 352497893608263498, base_len = 32177, edits = [Truncate(32175)]
+cc a8a531ce7ea623b09400c397cc304778602ce23403de97514423ef31187798d3 # shrinks to seed = 9430350013550874386, base_len = 28154, edits = [Truncate(28153)]
