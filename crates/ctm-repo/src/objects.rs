@@ -1,14 +1,17 @@
-//! Where objects live (R1): written into packs, found through the index.
+//! Where objects live: written into packs (R1), found by location hints (R3) or the index.
 //!
 //! Writes go into two open packs (data and metadata). A pack is uploaded when it reaches 32 MiB,
 //! and every open pack is closed and uploaded, followed by one index segment for everything
-//! uploaded since, by `flush`, which runs before every ref write. Until then, objects are read
-//! from memory (still in an open pack) or through their known location (uploaded, not yet
-//! indexed).
+//! uploaded since, by `flush`, which runs before every ref write. Each object is written with a
+//! hint per reference saying where the referenced object is, and refs carry hints for their
+//! roots, so readers go straight from a ref to any object without the index.
 //!
-//! Reads look in this process's unflushed objects, then the index mirror (a local SQLite copy of
-//! the bucket's index segments). On a miss the mirror is synced and consulted again; objects
-//! written before R1 are found under their loose key.
+//! A reader looks, in order:
+//! 1. in this handle's own packs (not yet indexed);
+//! 2. at a hint learned from a ref or a parent object, checking the object's hash;
+//! 3. in the index mirror (a local SQLite copy of the bucket's index segments);
+//! 4. under the loose key, where objects written before R1 live;
+//! 5. in the mirror again, after syncing it.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -20,8 +23,11 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use ctm_core::pack::{Location, PACK_TARGET, PackBuilder, PackId, decode_index, encode_index};
-use ctm_core::{Encoded, Id, ObjectType};
+use ctm_core::encoding::VerifyError;
+use ctm_core::pack::{
+    Entry, Listed, Location, PACK_TARGET, PackBuilder, PackId, decode_index, encode_index,
+};
+use ctm_core::{Encoded, Id, ObjectType, RepoKey};
 use ctm_store::{Backend, PutMode};
 
 use crate::{Error, Result};
@@ -30,6 +36,9 @@ use crate::{Error, Result};
 const CONCURRENCY: usize = 64;
 /// Packs uploading at once (each up to 32 MiB in memory).
 const PACK_UPLOADS: usize = 4;
+/// `index.db`'s schema; a database with another version is a cache from an older build and is
+/// rebuilt.
+const SCHEMA: i64 = 3;
 
 /// Where an object is stored before R1: `chunks/<id>` for chunks, `meta/<id>` for the rest.
 pub fn object_key(ty: ObjectType, id: &Id) -> String {
@@ -54,8 +63,15 @@ impl std::ops::Sub for Uploaded {
     }
 }
 
+/// An object as read: its stored form (`[type][flags][payload]`), and where the objects it
+/// references are (one per reference, or empty if unknown).
+pub struct Fetched {
+    pub stored: Bytes,
+    pub hints: Vec<Option<Location>>,
+}
+
 /// A finished pack's bytes, and where each object in it is.
-type Sealed = (Vec<u8>, Vec<(Id, Location)>);
+type Sealed = (Vec<u8>, Vec<Listed>);
 
 #[derive(Default)]
 struct Open {
@@ -63,64 +79,122 @@ struct Open {
     meta: Option<PackBuilder>,
     /// Objects in an open pack, or in one being uploaded.
     pending: HashMap<Id, Encoded>,
-    /// Objects in uploaded packs that no index segment lists yet.
-    unindexed: Vec<(Id, Location)>,
-    unindexed_at: HashMap<Id, Location>,
+    /// Every object in this handle's packs that no index segment lists yet.
+    located: HashMap<Id, (ObjectType, Location)>,
+    /// Objects in uploaded packs that no index segment lists yet, in upload order.
+    unindexed: Vec<Listed>,
     /// Packs being uploaded by `put`; `flush` waits for them.
     uploading: usize,
     /// Finished packs whose upload failed, retried by the next `put` or `flush`.
     failed: Vec<Sealed>,
 }
 
-/// The local mirror of the bucket's index segments.
-struct Mirror {
+/// `index.db`: the mirror of the bucket's index segments, and the hints learned from reads.
+/// Learned hints are kept apart because they're untrusted: reads use them, dedup never does.
+struct IndexDb {
     db: Mutex<Connection>,
 }
 
-impl Mirror {
-    fn open(path: Option<&Path>) -> Result<Mirror> {
+fn location(pack: Vec<u8>, offset: i64, len: i64) -> Result<Location> {
+    Ok(Location {
+        pack: PackId(pack.try_into().map_err(|_| bad_row())?),
+        offset: u32::try_from(offset).map_err(|_| bad_row())?,
+        len: u32::try_from(len).map_err(|_| bad_row())?,
+    })
+}
+
+impl IndexDb {
+    fn open(path: Option<&Path>) -> Result<IndexDb> {
         let db = match path {
             Some(p) => Connection::open(p),
             None => Connection::open_in_memory(),
         }
         .map_err(sqlite)?;
         db.busy_timeout(Duration::from_secs(10)).map_err(sqlite)?;
-        db.execute_batch(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
-             CREATE TABLE IF NOT EXISTS objects (
-                 id BLOB PRIMARY KEY, pack BLOB NOT NULL, offset INTEGER NOT NULL,
-                 len INTEGER NOT NULL, type INTEGER NOT NULL, flags INTEGER NOT NULL);
-             CREATE TABLE IF NOT EXISTS segments (key TEXT PRIMARY KEY);",
-        )
-        .map_err(sqlite)?;
-        Ok(Mirror { db: Mutex::new(db) })
+        db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")
+            .map_err(sqlite)?;
+        let version: i64 = db
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .map_err(sqlite)?;
+        if version != SCHEMA {
+            db.execute_batch(&format!(
+                "BEGIN;
+                 DROP TABLE IF EXISTS objects;
+                 DROP TABLE IF EXISTS segments;
+                 DROP TABLE IF EXISTS hints;
+                 CREATE TABLE objects (
+                     id BLOB PRIMARY KEY, pack BLOB NOT NULL, offset INTEGER NOT NULL,
+                     len INTEGER NOT NULL, type INTEGER NOT NULL);
+                 CREATE TABLE segments (key TEXT PRIMARY KEY);
+                 CREATE TABLE hints (
+                     id BLOB PRIMARY KEY, pack BLOB NOT NULL, offset INTEGER NOT NULL,
+                     len INTEGER NOT NULL);
+                 PRAGMA user_version = {SCHEMA};
+                 COMMIT;"
+            ))
+            .map_err(sqlite)?;
+        }
+        Ok(IndexDb { db: Mutex::new(db) })
     }
 
-    fn get(&self, id: &Id) -> Result<Option<Location>> {
+    fn indexed(&self, id: &Id) -> Result<Option<(ObjectType, Location)>> {
         let db = self.db.lock().unwrap();
-        let row: Option<(Vec<u8>, i64, i64, i64, i64)> = db
-            .query_row(
-                "SELECT pack, offset, len, type, flags FROM objects WHERE id = ?1",
-                [&id.0[..]],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
-            )
+        let row: Option<(Vec<u8>, i64, i64, i64)> = db
+            .prepare_cached("SELECT pack, offset, len, type FROM objects WHERE id = ?1")
+            .map_err(sqlite)?
+            .query_row([&id.0[..]], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
             .optional()
             .map_err(sqlite)?;
-        let Some((pack, offset, len, ty, flags)) = row else {
+        let Some((pack, offset, len, ty)) = row else {
             return Ok(None);
         };
-        Ok(Some(Location {
-            pack: PackId(pack.try_into().map_err(|_| bad_mirror())?),
-            offset: offset as u32,
-            stored_len: len as u32,
-            ty: ObjectType::from_u8(ty as u8).ok_or_else(bad_mirror)?,
-            flags: flags as u8,
-        }))
+        let ty = u8::try_from(ty)
+            .ok()
+            .and_then(ObjectType::from_u8)
+            .ok_or_else(bad_row)?;
+        Ok(Some((ty, location(pack, offset, len)?)))
     }
 
-    fn contains(&self, id: &Id) -> Result<bool> {
-        Ok(self.get(id)?.is_some())
+    fn learned(&self, id: &Id) -> Result<Option<Location>> {
+        let db = self.db.lock().unwrap();
+        let row: Option<(Vec<u8>, i64, i64)> = db
+            .prepare_cached("SELECT pack, offset, len FROM hints WHERE id = ?1")
+            .map_err(sqlite)?
+            .query_row([&id.0[..]], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .optional()
+            .map_err(sqlite)?;
+        row.map(|(p, o, l)| location(p, o, l)).transpose()
+    }
+
+    fn learn(&self, hints: &[(Id, Location)]) -> Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(sqlite)?;
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO hints (id, pack, offset, len) VALUES (?1, ?2, ?3, ?4)",
+                )
+                .map_err(sqlite)?;
+            for (id, loc) in hints {
+                stmt.execute(params![
+                    &id.0[..],
+                    &loc.pack.0[..],
+                    i64::from(loc.offset),
+                    i64::from(loc.len)
+                ])
+                .map_err(sqlite)?;
+            }
+        }
+        tx.commit().map_err(sqlite)
+    }
+
+    fn forget(&self, id: &Id) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        db.execute("DELETE FROM hints WHERE id = ?1", [&id.0[..]])
+            .map_err(sqlite)?;
+        Ok(())
     }
 
     fn seen(&self) -> Result<HashSet<String>> {
@@ -134,23 +208,26 @@ impl Mirror {
         Ok(keys)
     }
 
-    fn insert(&self, segment: &str, entries: &[(Id, Location)]) -> Result<()> {
+    fn insert(&self, segment: &str, entries: &[Listed]) -> Result<()> {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction().map_err(sqlite)?;
-        for (id, loc) in entries {
-            tx.execute(
-                "INSERT OR REPLACE INTO objects (id, pack, offset, len, type, flags)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT OR REPLACE INTO objects (id, pack, offset, len, type)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                )
+                .map_err(sqlite)?;
+            for (id, ty, loc) in entries {
+                stmt.execute(params![
                     &id.0[..],
                     &loc.pack.0[..],
                     i64::from(loc.offset),
-                    i64::from(loc.stored_len),
-                    i64::from(loc.ty as u8),
-                    i64::from(loc.flags),
-                ],
-            )
-            .map_err(sqlite)?;
+                    i64::from(loc.len),
+                    i64::from(*ty as u8),
+                ])
+                .map_err(sqlite)?;
+            }
         }
         tx.execute(
             "INSERT OR IGNORE INTO segments (key) VALUES (?1)",
@@ -192,13 +269,14 @@ fn sqlite(e: rusqlite::Error) -> Error {
     Error::Io(std::io::Error::other(format!("index.db: {e}")))
 }
 
-fn bad_mirror() -> Error {
+fn bad_row() -> Error {
     Error::Io(std::io::Error::other("index.db: a malformed row"))
 }
 
 pub(crate) struct Objects {
     backend: std::sync::Arc<dyn Backend>,
-    mirror: Mirror,
+    key: RepoKey,
+    index: IndexDb,
     open: Mutex<Open>,
     /// Objects this handle has written or read: they exist.
     known: Mutex<HashSet<Id>>,
@@ -220,11 +298,16 @@ fn new_pack() -> PackBuilder {
 }
 
 impl Objects {
-    /// `index_db` is where the index mirror lives; `None` keeps it in memory.
-    pub fn new(backend: std::sync::Arc<dyn Backend>, index_db: Option<&Path>) -> Result<Objects> {
+    /// `index_db` is where the index mirror and learned hints live; `None` keeps them in memory.
+    pub fn new(
+        backend: std::sync::Arc<dyn Backend>,
+        key: RepoKey,
+        index_db: Option<&Path>,
+    ) -> Result<Objects> {
         Ok(Objects {
             backend,
-            mirror: Mirror::open(index_db)?,
+            key,
+            index: IndexDb::open(index_db)?,
             open: Mutex::new(Open::default()),
             known: Mutex::new(HashSet::new()),
             flushing: tokio::sync::Mutex::new(()),
@@ -248,6 +331,25 @@ impl Objects {
         self.known.lock().unwrap().insert(id);
     }
 
+    /// Remembers where objects are, from a ref or from the hints of an object just read.
+    pub fn learn(&self, hints: &[(Id, Location)]) -> Result<()> {
+        if hints.is_empty() {
+            return Ok(());
+        }
+        self.index.learn(hints)
+    }
+
+    /// The best-known location of an object, to write as a hint.
+    pub fn hint(&self, id: &Id) -> Result<Option<Location>> {
+        if let Some((_, loc)) = self.open.lock().unwrap().located.get(id) {
+            return Ok(Some(*loc));
+        }
+        if let Some((_, loc)) = self.index.indexed(id)? {
+            return Ok(Some(loc));
+        }
+        self.index.learned(id)
+    }
+
     async fn put_counted(&self, key: &str, body: Vec<u8>) -> Result<()> {
         let len = body.len() as u64;
         let _permit = self.requests.acquire().await.expect("never closed");
@@ -260,7 +362,8 @@ impl Objects {
     }
 
     /// Adds objects to the open packs, skipping any already stored. Packs that reach the target
-    /// size are uploaded before this returns. Nothing is referenceable until `flush`.
+    /// size are uploaded before this returns. Nothing is referenceable until `flush`. Callers
+    /// add children before the objects that reference them, so their hints are known.
     pub async fn put(&self, objs: Vec<Encoded>) -> Result<()> {
         let mut full = Vec::new();
         {
@@ -268,11 +371,20 @@ impl Objects {
             let known = self.known.lock().unwrap();
             for obj in objs {
                 if known.contains(&obj.id)
-                    || open.pending.contains_key(&obj.id)
-                    || open.unindexed_at.contains_key(&obj.id)
-                    || self.mirror.contains(&obj.id)?
+                    || open.located.contains_key(&obj.id)
+                    || self.index.indexed(&obj.id)?.is_some()
                 {
                     continue;
+                }
+                let mut hints = Vec::with_capacity(obj.refs.len());
+                for r in &obj.refs {
+                    hints.push(match open.located.get(r) {
+                        Some((_, loc)) => Some(*loc),
+                        None => match self.index.indexed(r)? {
+                            Some((_, loc)) => Some(loc),
+                            None => self.index.learned(r)?,
+                        },
+                    });
                 }
                 let slot = if obj.ty.is_data() {
                     &mut open.data
@@ -280,10 +392,11 @@ impl Objects {
                     &mut open.meta
                 };
                 let pack = slot.get_or_insert_with(new_pack);
-                pack.add(&obj);
+                let loc = pack.add(&obj, &hints);
                 if pack.len() >= PACK_TARGET {
                     full.push(slot.take().expect("just used").finish());
                 }
+                open.located.insert(obj.id, (obj.ty, loc));
                 open.pending.insert(obj.id, obj);
             }
             full.append(&mut open.failed);
@@ -304,17 +417,17 @@ impl Objects {
     }
 
     async fn upload_pack(&self, (bytes, entries): Sealed) -> Result<()> {
+        let (_, ty, loc) = entries[0];
         let result = {
             let _slot = self.pack_uploads.acquire().await.expect("never closed");
-            self.put_counted(&entries[0].1.pack_key(), bytes.clone())
+            self.put_counted(&loc.key(ty.is_data()), bytes.clone())
                 .await
         };
         let mut open = self.open.lock().unwrap();
         match &result {
             Ok(()) => {
-                for (id, loc) in &entries {
+                for (id, _, _) in &entries {
                     open.pending.remove(id);
-                    open.unindexed_at.insert(*id, *loc);
                 }
                 open.unindexed.extend(entries);
             }
@@ -370,12 +483,12 @@ impl Objects {
         getrandom::fill(&mut seg).expect("the OS random source works");
         let key = format!("index/{}", hex::encode(seg));
         self.put_counted(&key, encode_index(&entries)).await?;
-        self.mirror.insert(&key, &entries)?;
+        self.index.insert(&key, &entries)?;
         let mut open = self.open.lock().unwrap();
         let mut known = self.known.lock().unwrap();
         open.unindexed.drain(..entries.len());
-        for (id, _) in &entries {
-            open.unindexed_at.remove(id);
+        for (id, _, _) in &entries {
+            open.located.remove(id);
             known.insert(*id);
         }
         Ok(())
@@ -391,7 +504,7 @@ impl Objects {
             return Ok(());
         }
         let started = Instant::now();
-        let seen = self.mirror.seen()?;
+        let seen = self.index.seen()?;
         let new: Vec<String> = self
             .backend
             .list("index/")
@@ -399,7 +512,7 @@ impl Objects {
             .into_iter()
             .filter(|k| !seen.contains(k))
             .collect();
-        let segments: Vec<(String, Vec<(Id, Location)>)> = stream::iter(new)
+        let segments: Vec<(String, Vec<Listed>)> = stream::iter(new)
             .map(|key| async move {
                 let (bytes, _) = {
                     let _permit = self.requests.acquire().await.expect("never closed");
@@ -415,41 +528,72 @@ impl Objects {
             .try_collect()
             .await?;
         for (key, entries) in segments {
-            self.mirror.insert(&key, &entries)?;
+            self.index.insert(&key, &entries)?;
         }
         *last = Some(started);
         Ok(())
     }
 
-    async fn read_packed(&self, loc: &Location) -> Result<Bytes> {
-        let payload = {
+    /// Reads one pack entry.
+    async fn read_entry(&self, id: &Id, data: bool, loc: &Location) -> Result<Fetched> {
+        let bytes = {
             let _permit = self.requests.acquire().await.expect("never closed");
-            self.backend.get_range(&loc.pack_key(), loc.range()).await?
+            self.backend.get_range(&loc.key(data), loc.range()).await?
         };
-        let mut stored = Vec::with_capacity(2 + payload.len());
-        stored.push(loc.ty as u8);
-        stored.push(loc.flags);
-        stored.extend_from_slice(&payload);
-        Ok(Bytes::from(stored))
+        let entry = Entry::parse(&bytes).map_err(|e| Error::Corrupt {
+            id: *id,
+            source: VerifyError::Decode(e),
+        })?;
+        Ok(Fetched {
+            stored: Bytes::from(entry.to_stored()),
+            hints: entry.hints,
+        })
     }
 
-    /// An object in its stored form (`[type][flags][payload]`); `data` says whether it's a
-    /// chunk, for the loose key.
-    ///
-    /// Looks in this process's unflushed objects, then the mirror, then the loose key (objects
-    /// written before R1), and only then syncs the mirror: reads of old objects never wait for
-    /// a sync, and a new machine pays one extra 404 before its first sync.
-    pub async fn read_stored(&self, data: bool, id: &Id) -> Result<Bytes> {
+    /// Reads through a learned hint: `None` if the hint is stale or wrong (then forgotten).
+    async fn read_hinted(&self, id: &Id, data: bool, loc: &Location) -> Result<Option<Fetched>> {
+        let fetched = match self.read_entry(id, data, loc).await {
+            Ok(f) => f,
+            Err(Error::Corrupt { .. } | Error::Store(ctm_store::Error::NotFound(_))) => {
+                self.index.forget(id)?;
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        };
+        let [ty, _, payload @ ..] = &fetched.stored[..] else {
+            unreachable!("a parsed entry has a type and flags");
+        };
+        let ty = ObjectType::from_u8(*ty).expect("a parsed entry has a known type");
+        if Id::compute(&self.key, ty, payload) != *id {
+            self.index.forget(id)?;
+            return Ok(None);
+        }
+        Ok(Some(fetched))
+    }
+
+    /// Reads an object; `data` says whether it's a chunk (which pack prefix and loose key).
+    pub async fn read(&self, data: bool, id: &Id) -> Result<Fetched> {
         let missed_at = Instant::now();
-        let unindexed = {
+        let mine = {
             let open = self.open.lock().unwrap();
             if let Some(obj) = open.pending.get(id) {
-                return Ok(Bytes::from(obj.to_stored()));
+                return Ok(Fetched {
+                    stored: Bytes::from(obj.to_stored()),
+                    hints: Vec::new(),
+                });
             }
-            open.unindexed_at.get(id).copied()
+            open.located.get(id).copied()
         };
-        if let Some(loc) = unindexed.or(self.mirror.get(id)?) {
-            return self.read_packed(&loc).await;
+        if let Some((ty, loc)) = mine {
+            return self.read_entry(id, ty.is_data(), &loc).await;
+        }
+        if let Some(loc) = self.index.learned(id)?
+            && let Some(f) = self.read_hinted(id, data, &loc).await?
+        {
+            return Ok(f);
+        }
+        if let Some((ty, loc)) = self.index.indexed(id)? {
+            return self.read_entry(id, ty.is_data(), &loc).await;
         }
         let ty = if data {
             ObjectType::Chunk
@@ -461,13 +605,18 @@ impl Objects {
             self.backend.get(&object_key(ty, id)).await
         };
         match loose {
-            Ok((bytes, _)) => return Ok(bytes),
+            Ok((stored, _)) => {
+                return Ok(Fetched {
+                    stored,
+                    hints: Vec::new(),
+                });
+            }
             Err(ctm_store::Error::NotFound(_)) => {}
             Err(e) => return Err(e.into()),
         }
         self.sync_index(Some(missed_at)).await?;
-        match self.mirror.get(id)? {
-            Some(loc) => self.read_packed(&loc).await,
+        match self.index.indexed(id)? {
+            Some((ty, loc)) => self.read_entry(id, ty.is_data(), &loc).await,
             None => Err(ctm_store::Error::NotFound(id.to_string()).into()),
         }
     }
@@ -476,25 +625,21 @@ impl Objects {
     pub async fn commits_with_prefix(&self, prefix: &str) -> Result<Vec<Id>> {
         self.sync_index(None).await?;
         let mut ids: HashSet<Id> = self
-            .mirror
+            .index
             .commits_with_prefix(prefix)?
             .into_iter()
             .collect();
-        {
-            let open = self.open.lock().unwrap();
-            let unflushed = open
-                .pending
+        ids.extend(
+            self.open
+                .lock()
+                .unwrap()
+                .located
                 .iter()
-                .filter(|(_, o)| o.ty == ObjectType::Commit)
-                .map(|(id, _)| *id)
-                .chain(
-                    open.unindexed_at
-                        .iter()
-                        .filter(|(_, l)| l.ty == ObjectType::Commit)
-                        .map(|(id, _)| *id),
-                );
-            ids.extend(unflushed.filter(|id| id.to_hex().starts_with(prefix)));
-        }
+                .filter(|(id, (ty, _))| {
+                    *ty == ObjectType::Commit && id.to_hex().starts_with(prefix)
+                })
+                .map(|(id, _)| *id),
+        );
         let loose = self.backend.list(&format!("meta/{prefix}")).await?;
         let mut out: Vec<Id> = ids.into_iter().collect();
         out.extend(

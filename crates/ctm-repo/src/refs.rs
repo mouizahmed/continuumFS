@@ -8,6 +8,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use ctm_core::Id;
+use ctm_core::pack::Location;
 
 /// A valid branch or snapshot name: 1–100 characters from `[A-Za-z0-9._-]`, not starting with
 /// `.` or `-`, no `..`, and not all hex with 8 or more characters.
@@ -79,6 +80,11 @@ pub struct BranchRef {
     pub head: Id,
     #[serde(with = "id_hex")]
     pub log: Id,
+    /// Where `head` and `log` are stored (R3). Written by every ref write; untrusted.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "hint_hex")]
+    pub head_hint: Option<Location>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "hint_hex")]
+    pub log_hint: Option<Location>,
     /// `None` for a branch made by `import`.
     pub forked_from: Option<ForkedFrom>,
     pub updated_at: String,
@@ -100,6 +106,9 @@ pub struct ForkedFrom {
 pub struct SnapshotRef {
     #[serde(with = "id_hex")]
     pub commit: Id,
+    /// Where `commit` is stored (R3); untrusted.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "hint_hex")]
+    pub commit_hint: Option<Location>,
     pub created_at: String,
     pub created_by: String,
 }
@@ -115,5 +124,25 @@ mod id_hex {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Id, D::Error> {
         String::deserialize(d)?.parse().map_err(D::Error::custom)
+    }
+}
+
+/// A hint as 48 hex characters. One that doesn't parse reads as absent: hints are untrusted.
+mod hint_hex {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use ctm_core::pack::Location;
+
+    pub fn serialize<S: Serializer>(hint: &Option<Location>, s: S) -> Result<S::Ok, S::Error> {
+        match hint {
+            Some(loc) => s.serialize_str(&hex::encode(loc.to_hint())),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Location>, D::Error> {
+        let s = Option::<String>::deserialize(d)?;
+        Ok(s.and_then(|s| hex::decode(s).ok())
+            .and_then(|b| Location::from_hint(&b)))
     }
 }

@@ -19,12 +19,15 @@ pub struct Counting {
     pub inner: MemBackend,
     pub chunk_gets: AtomicUsize,
     pub meta_gets: AtomicUsize,
+    /// GETs and LISTs under `index/`.
+    pub index_requests: AtomicUsize,
 }
 
 impl Counting {
     pub fn reset(&self) {
         self.chunk_gets.store(0, Ordering::SeqCst);
         self.meta_gets.store(0, Ordering::SeqCst);
+        self.index_requests.store(0, Ordering::SeqCst);
     }
 
     pub fn chunk_gets(&self) -> usize {
@@ -36,6 +39,8 @@ impl Counting {
             self.chunk_gets.fetch_add(1, Ordering::SeqCst);
         } else if key.starts_with("packs/meta/") {
             self.meta_gets.fetch_add(1, Ordering::SeqCst);
+        } else if key.starts_with("index/") {
+            self.index_requests.fetch_add(1, Ordering::SeqCst);
         }
     }
 }
@@ -46,7 +51,7 @@ pub async fn packed_chunks(backend: &dyn Backend) -> Vec<(String, Location)> {
     for key in backend.list("packs/data/").await.unwrap() {
         let (pack, _) = backend.get(&key).await.unwrap();
         let (_, entries) = read_trailer(&pack).unwrap();
-        out.extend(entries.into_iter().map(|(_, loc)| (key.clone(), loc)));
+        out.extend(entries.into_iter().map(|(_, _, loc)| (key.clone(), loc)));
     }
     out
 }
@@ -56,7 +61,7 @@ pub async fn corrupt_chunks(backend: &dyn Backend) {
     for key in backend.list("packs/data/").await.unwrap() {
         let (pack, _) = backend.get(&key).await.unwrap();
         let mut pack = pack.to_vec();
-        for (_, loc) in read_trailer(&pack).unwrap().1 {
+        for (_, _, loc) in read_trailer(&pack).unwrap().1 {
             pack[loc.range().end as usize - 1] ^= 1;
         }
         backend
@@ -83,6 +88,7 @@ impl Backend for Counting {
         self.inner.put(key, body, mode).await
     }
     async fn list(&self, prefix: &str) -> ctm_store::Result<Vec<String>> {
+        self.count(prefix);
         self.inner.list(prefix).await
     }
     async fn delete(&self, key: &str) -> ctm_store::Result<()> {

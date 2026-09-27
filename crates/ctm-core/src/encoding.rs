@@ -40,6 +40,12 @@ pub trait Object: Sized {
     /// Parses a payload, rejecting anything that isn't the canonical encoding of a valid value.
     fn decode(payload: &[u8], params: &FormatParams) -> Result<Self, DecodeError>;
 
+    /// The objects this one references, in the order the payload has them (a pack entry
+    /// carries one location hint per reference, in this order).
+    fn refs(&self) -> Vec<Id> {
+        Vec::new()
+    }
+
     /// The types read: `TYPE`, plus older types that decode into the same value.
     fn reads(ty: ObjectType) -> bool {
         ty == Self::TYPE
@@ -62,6 +68,8 @@ pub struct Encoded {
     pub id: Id,
     pub ty: ObjectType,
     pub payload: Vec<u8>,
+    /// What the object references ([`Object::refs`]).
+    pub refs: Vec<Id>,
 }
 
 impl Encoded {
@@ -71,6 +79,7 @@ impl Encoded {
             id: Id::compute(key, T::TYPE, &payload),
             ty: T::TYPE,
             payload,
+            refs: obj.refs(),
         }
     }
 
@@ -311,6 +320,10 @@ impl Object for Chunk {
 impl Object for ChunkPage {
     const TYPE: ObjectType = ObjectType::ChunkPage;
 
+    fn refs(&self) -> Vec<Id> {
+        self.chunks.iter().map(|c| c.id).collect()
+    }
+
     fn encode(&self) -> Vec<u8> {
         let mut w = Writer(Vec::with_capacity(2 + self.chunks.len() * 36));
         w.u16(self.chunks.len() as u16);
@@ -339,6 +352,10 @@ impl Object for ChunkPage {
 
 impl Object for ChunkList {
     const TYPE: ObjectType = ObjectType::ChunkList;
+
+    fn refs(&self) -> Vec<Id> {
+        self.pages.iter().map(|p| p.id).collect()
+    }
 
     fn encode(&self) -> Vec<u8> {
         let mut w = Writer(Vec::with_capacity(4 + self.pages.len() * 40));
@@ -527,6 +544,16 @@ pub fn encode_legacy_tree(tree: &Tree) -> Vec<u8> {
 impl Object for Tree {
     const TYPE: ObjectType = ObjectType::Tree;
 
+    fn refs(&self) -> Vec<Id> {
+        self.entries
+            .iter()
+            .filter_map(|e| match e.content {
+                Content::Chunk(id) | Content::ChunkList(id) | Content::Dir(id) => Some(id),
+                Content::Inline(_) | Content::Symlink(_) => None,
+            })
+            .collect()
+    }
+
     fn encode(&self) -> Vec<u8> {
         let mut w = Writer(Vec::new());
         w.u32(self.entries.len() as u32);
@@ -569,6 +596,10 @@ impl Object for Tree {
 impl Object for Commit {
     const TYPE: ObjectType = ObjectType::Commit;
 
+    fn refs(&self) -> Vec<Id> {
+        vec![self.root_tree]
+    }
+
     fn encode(&self) -> Vec<u8> {
         let mut w = Writer(Vec::new());
         w.id(&self.root_tree);
@@ -604,6 +635,14 @@ impl Object for Commit {
 
 impl Object for LogSegment {
     const TYPE: ObjectType = ObjectType::LogSegment;
+
+    fn refs(&self) -> Vec<Id> {
+        self.prev
+            .iter()
+            .copied()
+            .chain(self.entries.iter().map(|e| e.commit))
+            .collect()
+    }
 
     fn encode(&self) -> Vec<u8> {
         let mut w = Writer(Vec::new());

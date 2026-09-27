@@ -40,12 +40,14 @@ async fn mount() -> Fixture {
         hostname: "host".into(),
         machine_id: [1; 16],
     };
-    let (repo, _) = Repo::init(backend.clone(), identity).await.unwrap();
-    repo.import(root, &BranchName::new("main").unwrap(), "")
+    let (writer, _) = Repo::init(backend.clone(), identity.clone()).await.unwrap();
+    writer
+        .import(root, &BranchName::new("main").unwrap(), "")
         .await
         .unwrap();
-    backend.chunk_gets.store(0, Ordering::SeqCst);
-    backend.meta_gets.store(0, Ordering::SeqCst);
+    backend.reset();
+    // The mount is another machine: it knows only what the bucket tells it.
+    let repo = Repo::open(backend.clone(), identity).await.unwrap();
 
     let dirs = tempfile::tempdir().unwrap();
     let state = MountState::open(
@@ -252,4 +254,13 @@ async fn read_only_mounts_refuse_writes() {
     let f = mount().await;
     let ino = lookup_path(&f.state, "small.txt").await.unwrap();
     assert_eq!(f.state.open_file(ino, true).await, Err(Errno::EROFS));
+}
+
+#[tokio::test]
+async fn a_fresh_mount_reads_everything_without_the_index() {
+    let f = mount().await;
+    let files = walk_mount(&f.state).await;
+    assert_eq!(files.len(), 9);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(f.backend.index_requests.load(Ordering::SeqCst), 0);
 }

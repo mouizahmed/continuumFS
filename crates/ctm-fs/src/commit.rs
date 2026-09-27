@@ -345,6 +345,8 @@ impl MountState {
             let fork = BranchRef {
                 head: prepared.commit,
                 log: prepared.new_ref.log,
+                head_hint: None,
+                log_hint: None,
                 forked_from: Some(ForkedFrom {
                     from: branch.to_string(),
                     commit: base.commit,

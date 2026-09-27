@@ -14,7 +14,7 @@ use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
 use tokio::sync::Semaphore;
 
-use ctm_core::encoding::{VerifyError, decode_verified};
+use ctm_core::encoding::decode_verified;
 use ctm_core::{Chunk, ChunkRef, Id, Object, Tree};
 use ctm_repo::Repo;
 use ctm_store::cache::{CacheStats, ChunkCache, MetaCache};
@@ -99,19 +99,12 @@ impl Fetcher {
             None
         };
         let _permit = self.foreground.acquire().await.expect("never closed");
-        let repo = &self.repo;
-        let mut retried = false;
-        loop {
-            let bytes = repo
-                .read_stored(T::TYPE, id)
-                .await
-                .map_err(FetchError::new)?;
-            match decode_verified::<T>(repo.key(), id, &bytes, repo.params()) {
-                Ok(obj) => return Ok((obj, bytes.to_vec())),
-                Err(VerifyError::HashMismatch { .. }) if !retried => retried = true,
-                Err(e) => return Err(FetchError::new(format!("object {id}: {e}"))),
-            }
-        }
+        let (obj, stored) = self
+            .repo
+            .fetch::<T>(id)
+            .await
+            .map_err(|e| FetchError::new(format!("object {id}: {e}")))?;
+        Ok((obj, stored.to_vec()))
     }
 
     /// A metadata object, from the cache or the bucket.

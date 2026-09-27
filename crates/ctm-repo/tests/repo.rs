@@ -228,7 +228,7 @@ impl Counting {
         }
         self.got.lock().unwrap().clear();
     }
-    /// Keys read so far that start with `prefix`.
+    /// Keys read (and `LIST <prefix>`es) so far that start with `prefix`.
     fn got(&self, prefix: &str) -> usize {
         let got = self.got.lock().unwrap();
         got.iter().filter(|k| k.starts_with(prefix)).count()
@@ -255,6 +255,7 @@ impl Backend for Counting {
     }
     async fn list(&self, prefix: &str) -> ctm_store::Result<Vec<String>> {
         self.lists.fetch_add(1, Ordering::SeqCst);
+        self.got.lock().unwrap().push(format!("LIST {prefix}"));
         self.inner.list(prefix).await
     }
     async fn delete(&self, key: &str) -> ctm_store::Result<()> {
@@ -742,6 +743,8 @@ async fn a_version_1_repo_is_read_and_upgraded_on_first_write() {
         &ctm_repo::BranchRef {
             head,
             log: log_id,
+            head_hint: None,
+            log_hint: None,
             forked_from: None,
             updated_at: "2026-09-27T00:00:00Z".into(),
             updated_by: "me".into(),
@@ -825,11 +828,74 @@ async fn the_index_mirror_persists_between_opens() {
             .unwrap()
     };
     be.reset();
-    open().await.ls(&spec("main")).await.unwrap();
+    open().await.sync_index().await.unwrap();
     assert_eq!(be.got("index/"), 1);
     be.reset();
-    open().await.ls(&spec("main")).await.unwrap();
+    open().await.sync_index().await.unwrap();
     assert_eq!(be.got("index/"), 0);
+}
+
+/// R3: refs and objects carry hints, so another machine reads any branch, fork, or snapshot
+/// straight from the packs, without listing or reading the index.
+#[tokio::test]
+async fn a_fresh_handle_reads_by_hints_without_the_index() {
+    let src = tempfile::tempdir().unwrap();
+    sample_tree(src.path());
+    let be = Arc::new(Counting::default());
+    let writer = repo_on(be.clone()).await;
+    writer.import(src.path(), &name("main"), "").await.unwrap();
+    writer.fork(&spec("main"), &name("feature")).await.unwrap();
+    writer.snapshot(&name("v1"), &spec("main")).await.unwrap();
+    for target in ["main", "feature", "snap/v1"] {
+        be.reset();
+        let reader = Repo::open(be.clone(), identity()).await.unwrap();
+        let out = tempfile::tempdir().unwrap();
+        reader
+            .export(&spec(target), &out.path().join("x"))
+            .await
+            .unwrap();
+        assert_eq!(snapshot(&out.path().join("x")), snapshot(src.path()));
+        assert_eq!(be.got("index/"), 0, "{target}");
+        assert_eq!(be.got("LIST index/"), 0, "{target}");
+        assert_eq!(
+            be.got("meta/") + be.got("chunks/"),
+            0,
+            "no loose-key misses"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_stale_hint_falls_back_to_the_index() {
+    let src = tempfile::tempdir().unwrap();
+    sample_tree(src.path());
+    let be = Arc::new(Counting::default());
+    repo_on(be.clone())
+        .await
+        .import(src.path(), &name("main"), "")
+        .await
+        .unwrap();
+    // Point the head's hint at the log segment's entry: the hash won't match.
+    let (body, _) = be.inner.get("refs/branches/main").await.unwrap();
+    let mut r: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    r["head_hint"] = r["log_hint"].clone();
+    be.inner
+        .put(
+            "refs/branches/main",
+            serde_json::to_vec(&r).unwrap().into(),
+            PutMode::Overwrite,
+        )
+        .await
+        .unwrap();
+    be.reset();
+    let reader = Repo::open(be.clone(), identity()).await.unwrap();
+    let out = tempfile::tempdir().unwrap();
+    reader
+        .export(&spec("main"), &out.path().join("x"))
+        .await
+        .unwrap();
+    assert_eq!(snapshot(&out.path().join("x")), snapshot(src.path()));
+    assert_eq!(be.got("LIST index/"), 1);
 }
 
 #[tokio::test]

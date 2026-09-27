@@ -17,7 +17,7 @@ use ctm_core::encoding::{VerifyError, decode_verified};
 use ctm_core::layout::paginate;
 use ctm_core::{
     Chunk, ChunkList, ChunkRef, Commit, CommitKind, Content, DirEntry, Encoded, FormatParams, Id,
-    Kind, LogEntry, LogSegment, Object, ObjectType, PageRef, RepoKey, Tree,
+    Kind, LogEntry, LogSegment, Object, PageRef, RepoKey, Tree,
 };
 use ctm_store::{Backend, ETag, PutMode};
 
@@ -192,12 +192,13 @@ impl Repo {
     }
 
     fn new(backend: Arc<dyn Backend>, config: RepoConfig, identity: Identity) -> Result<Repo> {
+        let key = config.key()?;
         Ok(Repo {
-            key: config.key()?,
+            objects: Objects::new(backend.clone(), key.clone(), None)?,
+            key,
             params: config.params(),
             format_version: AtomicU32::new(config.format_version),
             config,
-            objects: Objects::new(backend.clone(), None)?,
             backend,
             identity,
         })
@@ -233,14 +234,32 @@ impl Repo {
             }
             Err(e) => return Err(e.into()),
         };
-        let r = serde_json::from_slice(&bytes).map_err(|e| corrupt_json(&name.branch_key(), e))?;
+        let r: BranchRef =
+            serde_json::from_slice(&bytes).map_err(|e| corrupt_json(&name.branch_key(), e))?;
+        let hints = [(r.head, r.head_hint), (r.log, r.log_hint)];
+        self.objects.learn(
+            &hints
+                .into_iter()
+                .filter_map(|(id, h)| Some((id, h?)))
+                .collect::<Vec<_>>(),
+        )?;
         Ok((r, etag))
+    }
+
+    /// Uploads everything pending, then serializes `r` with hints for its head and log.
+    async fn ref_body(&self, r: &BranchRef) -> Result<Vec<u8>> {
+        self.flush().await?;
+        let r = BranchRef {
+            head_hint: self.objects.hint(&r.head)?,
+            log_hint: self.objects.hint(&r.log)?,
+            ..r.clone()
+        };
+        Ok(serde_json::to_vec_pretty(&r).expect("ref serializes"))
     }
 
     /// Create-only (`If-None-Match: *`).
     pub async fn create_ref(&self, name: &BranchName, new: &BranchRef) -> Result<ETag> {
-        self.flush().await?;
-        let body = serde_json::to_vec_pretty(new).expect("ref serializes");
+        let body = self.ref_body(new).await?;
         match self
             .backend
             .put(&name.branch_key(), body.into(), PutMode::CreateOnly)
@@ -260,8 +279,7 @@ impl Repo {
         new: &BranchRef,
         expected: &ETag,
     ) -> Result<ETag> {
-        self.flush().await?;
-        let body = serde_json::to_vec_pretty(new).expect("ref serializes");
+        let body = self.ref_body(new).await?;
         Ok(self
             .backend
             .put(
@@ -285,7 +303,11 @@ impl Repo {
             }
             Err(e) => return Err(e.into()),
         };
-        serde_json::from_slice(&bytes).map_err(|e| corrupt_json(&key, e))
+        let s: SnapshotRef = serde_json::from_slice(&bytes).map_err(|e| corrupt_json(&key, e))?;
+        if let Some(hint) = s.commit_hint {
+            self.objects.learn(&[(s.commit, hint)])?;
+        }
+        Ok(s)
     }
 
     pub async fn list_snapshots(&self) -> Result<Vec<BranchName>> {
@@ -312,24 +334,34 @@ impl Repo {
     /// Keeps the index mirror in `path` (a SQLite file) instead of in memory, so later
     /// processes start with it. Call right after opening.
     pub fn with_index_at(mut self, path: &Path) -> Result<Repo> {
-        self.objects = Objects::new(self.backend.clone(), Some(path))?;
+        self.objects = Objects::new(self.backend.clone(), self.key.clone(), Some(path))?;
         Ok(self)
-    }
-
-    /// An object in its stored form (`[type][flags][payload]`), not yet verified.
-    pub async fn read_stored(&self, ty: ObjectType, id: &Id) -> Result<Bytes> {
-        self.objects.read_stored(ty.is_data(), id).await
     }
 
     /// Fetches, hash-verifies, and decodes an object. A hash mismatch is retried once.
     pub async fn get<T: Object>(&self, id: &Id) -> Result<T> {
+        Ok(self.fetch(id).await?.0)
+    }
+
+    /// Like `get`, and also returns the object's stored form (`[type][flags][payload]`), for
+    /// caching. Remembers where the objects it references are, from its hints.
+    pub async fn fetch<T: Object>(&self, id: &Id) -> Result<(T, Bytes)> {
         let mut retried = false;
         loop {
-            let bytes = self.read_stored(T::TYPE, id).await?;
-            match decode_verified::<T>(&self.key, id, &bytes, &self.params) {
+            let fetched = self.objects.read(T::TYPE.is_data(), id).await?;
+            match decode_verified::<T>(&self.key, id, &fetched.stored, &self.params) {
                 Ok(obj) => {
                     self.objects.mark_known(*id);
-                    return Ok(obj);
+                    let refs = obj.refs();
+                    if fetched.hints.len() == refs.len() {
+                        let learned: Vec<_> = refs
+                            .into_iter()
+                            .zip(fetched.hints)
+                            .filter_map(|(id, h)| Some((id, h?)))
+                            .collect();
+                        self.objects.learn(&learned)?;
+                    }
+                    return Ok((obj, fetched.stored));
                 }
                 Err(VerifyError::HashMismatch { .. }) if !retried => retried = true,
                 Err(source) => return Err(Error::Corrupt { id: *id, source }),
@@ -481,6 +513,8 @@ impl Repo {
         Ok(BranchRef {
             head: commit,
             log,
+            head_hint: None,
+            log_hint: None,
             forked_from: current.forked_from.clone(),
             updated_at: rfc3339(now_ns()),
             updated_by: self.identity.updated_by(),
@@ -503,6 +537,8 @@ impl Repo {
         Ok(BranchRef {
             head: commit,
             log,
+            head_hint: None,
+            log_hint: None,
             forked_from,
             updated_at: rfc3339(now_ns()),
             updated_by: self.identity.updated_by(),
@@ -562,6 +598,8 @@ impl Repo {
             Some((name, r, _)) => BranchRef {
                 head: r.head,
                 log: r.log,
+                head_hint: None,
+                log_hint: None,
                 forked_from: Some(ForkedFrom {
                     from: name.to_string(),
                     commit,
@@ -598,10 +636,15 @@ impl Repo {
         let (commit, _) = self.resolve_commit(&from.target).await?;
         let snap = SnapshotRef {
             commit,
+            commit_hint: None,
             created_at: rfc3339(now_ns()),
             created_by: self.identity.updated_by(),
         };
         self.flush().await?;
+        let snap = SnapshotRef {
+            commit_hint: self.objects.hint(&snap.commit)?,
+            ..snap
+        };
         let body = serde_json::to_vec_pretty(&snap).expect("snapshot serializes");
         match self
             .backend
