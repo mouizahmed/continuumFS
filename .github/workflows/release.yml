@@ -1,0 +1,62 @@
+name: Release
+
+# Pushing a tag vX.Y.Z builds static Linux binaries and attaches them to a draft release, which is
+# published by hand after its notes are written. Running the workflow by hand only builds them.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --locked -p ctm --target ${{ matrix.target }}
+      - name: Check that the binary is static and runs
+        run: |
+          bin=target/${{ matrix.target }}/release/ctm
+          file "$bin" | grep -q 'statically linked'
+          "$bin" --version
+      - name: Package
+        run: |
+          name=ctm-${GITHUB_REF_NAME#v}-${{ matrix.target }}
+          [ "$GITHUB_REF_TYPE" = tag ] || name=ctm-dev-${{ matrix.target }}
+          mkdir -p "dist/$name"
+          cp target/${{ matrix.target }}/release/ctm LICENSE README.md "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.tar.gz*
+
+  draft:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: gh release create "$GITHUB_REF_NAME" dist/* --draft --verify-tag --title "$GITHUB_REF_NAME" --notes "Notes to follow."
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
