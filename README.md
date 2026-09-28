@@ -22,7 +22,7 @@ that changed.
 
 It is written in Rust as a single binary (`ctm`), Apache-2.0.
 
-> **Status: v0.2.** Linux only (x86_64 and aarch64). The storage format is versioned: repos
+> **Status: v0.3.** Linux only (x86_64 and aarch64). The storage format is versioned: repos
 > written by this version stay readable by later ones, not the other way round. See
 > [Limits](#limits).
 
@@ -34,13 +34,13 @@ the static binary for your architecture from the
 
 ```sh
 arch=$(uname -m)   # x86_64 or aarch64
-curl -fsSL https://github.com/mouizahmed/continuumFS/releases/download/v0.2.0/ctm-0.2.0-$arch-unknown-linux-musl.tar.gz \
-  | tar -xz --strip-components=1 -C ~/.local/bin ctm-0.2.0-$arch-unknown-linux-musl/ctm
+curl -fsSL https://github.com/mouizahmed/continuumFS/releases/download/v0.3.0/ctm-0.3.0-$arch-unknown-linux-musl.tar.gz \
+  | tar -xz --strip-components=1 -C ~/.local/bin ctm-0.3.0-$arch-unknown-linux-musl/ctm
 ctm --version
 ```
 
 Or build it from source with Rust 1.98 or newer:
-`cargo install --git https://github.com/mouizahmed/continuumFS --tag v0.2.0 ctm`.
+`cargo install --git https://github.com/mouizahmed/continuumFS --tag v0.3.0 ctm`.
 
 Try it without any cloud account, with a repo in a local directory:
 
@@ -183,7 +183,7 @@ Published as measured, wins and losses; details and a reading of each number are
 | Cold `git status` over the Linux kernel tree | 92 min: git re-reads every file on a fresh mount |
 
 Sequential throughput, small-file commits, and `git status` on a fresh mount were v0's weak spots.
-v0.2 fixes the last two (below); sequential throughput is next on the roadmap.
+v0.2 fixed the last two, and v0.3 sequential throughput (below).
 
 **In v0.2:**
 
@@ -203,7 +203,7 @@ v0.2 fixes the last two (below); sequential throughput is next on the roadmap.
 Repos written by v0.1 are still read by v0.2, and are upgraded to format version 2 on their first
 write, after which v0.1 refuses them.
 
-**Since v0.2** (unreleased, on `main`):
+**In v0.3:**
 
 - Random reads download only the 64 KiB blocks they touch, and sequential reads stream whole
   pack spans. A cold sequential read of 10 GiB went from 40 MB/s to 100 MB/s (mountpoint-s3:
