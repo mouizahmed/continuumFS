@@ -350,16 +350,25 @@ impl Objects {
     pub fn set_outgoing(&mut self, dir: &Path) -> Result<()> {
         std::fs::create_dir_all(dir)?;
         let mut found = Vec::new();
+        let gone = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
         for f in std::fs::read_dir(dir)? {
             let path = f?.path();
-            // `.pushed` files are in the bucket already; `.tmp` ones were never sealed.
-            if path.extension().is_some_and(|e| e == "pack")
-                && let Ok((pack, entries)) = read_trailer(&std::fs::read(&path)?)
-                && !entries.is_empty()
-            {
-                found.push((pack, path, entries));
-            } else {
-                std::fs::remove_file(&path)?;
+            // `.pushed` files are in the bucket already; `.tmp` ones were never sealed. A file
+            // can vanish meanwhile (a previous owner still deleting what it cached).
+            let pack = match path.extension().is_some_and(|e| e == "pack") {
+                true => match std::fs::read(&path) {
+                    Ok(bytes) => read_trailer(&bytes).ok().filter(|(_, e)| !e.is_empty()),
+                    Err(e) if gone(&e) => continue,
+                    Err(e) => return Err(e.into()),
+                },
+                false => None,
+            };
+            match pack {
+                Some((pack, entries)) => found.push((pack, path, entries)),
+                None => match std::fs::remove_file(&path) {
+                    Err(e) if !gone(&e) => return Err(e.into()),
+                    _ => {}
+                },
             }
         }
         let open = self.open.get_mut().unwrap();
