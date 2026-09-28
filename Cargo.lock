@@ -453,6 +453,7 @@ dependencies = [
  "blake3",
  "bytes",
  "ctm-core",
+ "futures",
  "hex",
  "object_store",
  "rusqlite",

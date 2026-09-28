@@ -285,7 +285,7 @@ pub(crate) struct Objects {
     idle: tokio::sync::Notify,
     /// When the last completed sync started.
     synced: tokio::sync::Mutex<Option<Instant>>,
-    requests: tokio::sync::Semaphore,
+    requests: std::sync::Arc<tokio::sync::Semaphore>,
     pack_uploads: tokio::sync::Semaphore,
     uploaded_objects: AtomicU64,
     uploaded_bytes: AtomicU64,
@@ -313,7 +313,7 @@ impl Objects {
             flushing: tokio::sync::Mutex::new(()),
             idle: tokio::sync::Notify::new(),
             synced: tokio::sync::Mutex::new(None),
-            requests: tokio::sync::Semaphore::new(CONCURRENCY),
+            requests: std::sync::Arc::new(tokio::sync::Semaphore::new(CONCURRENCY)),
             pack_uploads: tokio::sync::Semaphore::new(PACK_UPLOADS),
             uploaded_objects: AtomicU64::new(0),
             uploaded_bytes: AtomicU64::new(0),
@@ -532,6 +532,49 @@ impl Objects {
         }
         *last = Some(started);
         Ok(())
+    }
+
+    /// Where an object's entry is, without a request: in this handle's packs, at a learned
+    /// hint (untrusted), or in the mirror. `None` for loose objects and ones not known here.
+    pub fn locate(&self, id: &Id) -> Result<Option<Location>> {
+        if let Some((_, loc)) = self.open.lock().unwrap().located.get(id) {
+            return Ok(Some(*loc));
+        }
+        if let Some(loc) = self.index.learned(id)? {
+            return Ok(Some(loc));
+        }
+        Ok(self.index.indexed(id)?.map(|(_, loc)| loc))
+    }
+
+    /// Drops a learned hint that turned out wrong.
+    pub fn forget(&self, id: &Id) -> Result<()> {
+        self.index.forget(id)
+    }
+
+    /// A ranged GET, counted against the repo's request limit.
+    pub async fn get_range(&self, key: &str, range: std::ops::Range<u64>) -> Result<Bytes> {
+        let _permit = self.requests.acquire().await.expect("never closed");
+        Ok(self.backend.get_range(key, range).await?)
+    }
+
+    /// A ranged GET whose body arrives in pieces. It holds a request permit until the body has
+    /// been read or dropped.
+    pub async fn get_range_stream(
+        &self,
+        key: &str,
+        range: std::ops::Range<u64>,
+    ) -> Result<ctm_store::ByteStream> {
+        let permit = self
+            .requests
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("never closed");
+        let body = self.backend.get_range_stream(key, range).await?;
+        Ok(Box::pin(body.map(move |piece| {
+            let _held = &permit;
+            piece
+        })))
     }
 
     /// Reads one pack entry.

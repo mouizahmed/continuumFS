@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{self, Read, Write};
+use std::ops::Range;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
@@ -9,20 +10,22 @@ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime};
 
 use bytes::Bytes;
+use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt, stream};
 
 use ctm_core::chunker::next_cut;
 use ctm_core::diff::{Change, diff_trees};
 use ctm_core::encoding::{VerifyError, decode_verified};
 use ctm_core::layout::paginate;
+use ctm_core::pack::{ENTRY_HEADER, Entry, Location};
 use ctm_core::{
     Chunk, ChunkList, ChunkRef, Commit, CommitKind, Content, DirEntry, Encoded, FormatParams, Id,
-    Kind, LogEntry, LogSegment, Object, PageRef, RepoKey, Tree,
+    Kind, LogEntry, LogSegment, Object, ObjectType, PageRef, RepoKey, Tree,
 };
 use ctm_store::{Backend, ETag, PutMode};
 
 use crate::config::FORMAT_VERSION;
-use crate::objects::{Objects, Uploaded};
+use crate::objects::{Objects, Uploaded, object_key};
 use crate::refs::{BranchName, BranchRef, ForkedFrom, SnapshotRef};
 use crate::refspec::{RefSpec, RefTarget};
 use crate::time::{now_ns, rfc3339};
@@ -367,6 +370,141 @@ impl Repo {
                 Err(source) => return Err(Error::Corrupt { id: *id, source }),
             }
         }
+    }
+
+    /// Bytes `range` of a chunk's data with one ranged GET where the chunk is stored, without
+    /// verifying them (a part of a chunk can't be hash-checked; the caller verifies the chunk
+    /// once it has all of it). Falls back to fetching the whole chunk when its location is
+    /// unknown or wrong.
+    pub async fn chunk_range(&self, id: &Id, range: Range<u32>) -> Result<Bytes> {
+        let (start, end) = (u64::from(range.start), u64::from(range.end));
+        let direct = match self.objects.locate(id)? {
+            Some(loc) => {
+                let payload = u64::from(loc.offset) + ENTRY_HEADER as u64;
+                if payload + end <= loc.range().end {
+                    let key = loc.key(true);
+                    Some((key, payload + start..payload + end, true))
+                } else {
+                    None
+                }
+            }
+            // Loose (written before R1): `[type][flags]` then the chunk.
+            None => Some((object_key(ObjectType::Chunk, id), 2 + start..2 + end, false)),
+        };
+        if let Some((key, bytes, hinted)) = direct {
+            match self.objects.get_range(&key, bytes).await {
+                Ok(b) if b.len() == range.len() => return Ok(b),
+                Ok(_) | Err(Error::Store(ctm_store::Error::NotFound(_))) => {
+                    if hinted {
+                        self.objects.forget(id)?;
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        let (chunk, _) = self.fetch::<Chunk>(id).await?;
+        let r = range.start as usize..range.end as usize;
+        chunk
+            .0
+            .get(r)
+            .map(Bytes::copy_from_slice)
+            .ok_or_else(|| Error::PathNotFound(format!("bytes {range:?} of chunk {id}")))
+    }
+
+    /// Whole chunks, hash-verified, each as soon as it has arrived (in no particular order).
+    /// Chunks stored one after another in a pack come from one streamed ranged GET of up to
+    /// `max_span` bytes; the rest, and any a run fails to deliver, are fetched one by one.
+    pub fn fetch_chunks(&self, ids: &[Id], max_span: u64) -> BoxStream<'_, (Id, Result<Chunk>)> {
+        // Runs of chunks adjacent in one pack; `None` for chunks whose location isn't known.
+        type Run = (Option<Location>, VecDeque<(Id, Option<Location>)>);
+        let mut runs: Vec<Run> = Vec::new();
+        for id in ids {
+            let loc = self.objects.locate(id).ok().flatten();
+            if let (Some(l), Some((Some(run), members))) = (loc, runs.last_mut())
+                && l.pack == run.pack
+                && l.offset == run.offset + run.len
+                && u64::from(run.len) + u64::from(l.len) <= max_span
+            {
+                run.len += l.len;
+                members.push_back((*id, loc));
+                continue;
+            }
+            runs.push((loc, VecDeque::from([(*id, loc)])));
+        }
+        let streams = runs
+            .into_iter()
+            .map(|(run, members)| self.run_chunks(run, members));
+        Box::pin(stream::iter(streams).flatten_unordered(None))
+    }
+
+    /// The chunks of one run, read from a single streamed GET as their bytes arrive.
+    fn run_chunks(
+        &self,
+        run: Option<Location>,
+        members: VecDeque<(Id, Option<Location>)>,
+    ) -> BoxStream<'_, (Id, Result<Chunk>)> {
+        struct Run {
+            span: Option<Location>,
+            body: Option<ctm_store::ByteStream>,
+            opened: bool,
+            /// Bytes of the run received and not yet consumed, starting at `consumed`.
+            buf: Vec<u8>,
+            consumed: usize,
+            members: VecDeque<(Id, Option<Location>)>,
+        }
+        let state = Run {
+            span: run,
+            body: None,
+            opened: false,
+            buf: Vec::new(),
+            consumed: 0,
+            members,
+        };
+        Box::pin(stream::unfold(state, move |mut st| async move {
+            let (id, loc) = st.members.pop_front()?;
+            if !st.opened {
+                st.opened = true;
+                if let Some(span) = st.span {
+                    st.body = self
+                        .objects
+                        .get_range_stream(&span.key(true), span.range())
+                        .await
+                        .ok();
+                }
+            }
+            let mut from_run = None;
+            if let (Some(span), Some(loc), Some(body)) = (st.span, loc, st.body.as_mut()) {
+                let start = (loc.offset - span.offset) as usize;
+                let end = start + loc.len as usize;
+                while st.consumed + st.buf.len() < end {
+                    match body.next().await {
+                        Some(Ok(piece)) => st.buf.extend_from_slice(&piece),
+                        _ => break,
+                    }
+                }
+                if st.consumed + st.buf.len() >= end {
+                    from_run = Entry::parse(&st.buf[start - st.consumed..end - st.consumed])
+                        .ok()
+                        .and_then(|e| {
+                            decode_verified::<Chunk>(&self.key, &id, &e.to_stored(), &self.params)
+                                .ok()
+                        });
+                    st.buf.drain(..end - st.consumed);
+                    st.consumed = end;
+                } else {
+                    // The body ended early: the rest of the run is fetched one by one.
+                    st.body = None;
+                }
+            }
+            let result = match from_run {
+                Some(c) => {
+                    self.objects.mark_known(id);
+                    Ok(c)
+                }
+                None => self.fetch::<Chunk>(&id).await.map(|(c, _)| c),
+            };
+            Some(((id, result), st))
+        }))
     }
 
     /// Adds objects that aren't already stored to this handle's packs. They're uploaded as packs

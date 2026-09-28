@@ -177,10 +177,23 @@ async fn every_chunk_is_downloaded_once_and_then_served_from_cache() {
     assert_eq!(read_all(&f.state, ino).await, random_bytes(1, BIG));
     tokio::time::sleep(Duration::from_millis(300)).await;
     let chunks = packed_chunks(&f.backend.inner).await.len();
-    // big.bin and one_chunk.bin share no chunks; big.bin has all but one.
-    assert_eq!(f.backend.chunk_gets.load(Ordering::SeqCst), chunks - 1);
+    // big.bin and one_chunk.bin share no chunks; big.bin has all but one. Readahead fetches
+    // runs of them with one GET, and every byte comes down once, except that the first chunk
+    // may come twice: the reads before the stream is recognised as sequential fetch blocks,
+    // and caching those runs in the background.
+    let gets = f.backend.chunk_gets.load(Ordering::SeqCst);
+    assert!(
+        gets < (chunks - 1) / 2,
+        "{gets} GETs for {} chunks",
+        chunks - 1
+    );
+    let fetched = f.state.cache_stats().unwrap().fetched_bytes;
+    assert!(
+        (BIG as u64..=BIG as u64 + (4 << 20)).contains(&fetched),
+        "{fetched}"
+    );
     read_all(&f.state, ino).await;
-    assert_eq!(f.backend.chunk_gets.load(Ordering::SeqCst), chunks - 1);
+    assert_eq!(f.backend.chunk_gets.load(Ordering::SeqCst), gets);
 }
 
 #[tokio::test]
@@ -235,7 +248,46 @@ async fn a_corrupt_chunk_reads_as_eio() {
     corrupt_chunks(&f.backend.inner).await;
     let ino = lookup_path(&f.state, "one_chunk.bin").await.unwrap();
     let fh = f.state.open_file(ino, false).await.unwrap();
-    assert_eq!(f.state.read(fh, ino, 0, 10).await, Err(Errno::EIO));
+    // A read of the whole chunk verifies it.
+    assert_eq!(f.state.read(fh, ino, 0, 200_000).await, Err(Errno::EIO));
+}
+
+#[tokio::test]
+async fn a_corrupt_chunk_filled_by_blocks_is_evicted_once_complete() {
+    let f = mount().await;
+    corrupt_chunks(&f.backend.inner).await;
+    let ino = lookup_path(&f.state, "one_chunk.bin").await.unwrap();
+    let fh = f.state.open_file(ino, false).await.unwrap();
+    // Partial reads can't be verified: the first block is served as stored.
+    let first = f.state.read(fh, ino, 0, 10).await.unwrap();
+    assert_eq!(first, random_bytes(2, 100_000)[..10]);
+    // Reading the second (corrupt) block, on another handle so it isn't taken for a
+    // sequential read, completes the chunk; verification then evicts it.
+    let other = f.state.open_file(ino, false).await.unwrap();
+    f.state.read(other, ino, 70_000, 10).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(f.state.cache_stats().unwrap().objects, 0);
+}
+
+#[tokio::test]
+async fn a_random_read_downloads_one_block() {
+    let f = mount().await;
+    let data = random_bytes(1, BIG);
+    let ino = lookup_path(&f.state, "big.bin").await.unwrap();
+    let fh = f.state.open_file(ino, false).await.unwrap();
+    let off = 13_000_000;
+    let got = f.state.read(fh, ino, off, 4096).await.unwrap();
+    assert_eq!(got, &data[off as usize..off as usize + 4096]);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let fetched = f.state.cache_stats().unwrap().fetched_bytes;
+    assert!(fetched <= 2 * 64 * 1024, "{fetched} bytes for a 4 KiB read");
+    // Cached: reading it again downloads nothing, even in a new mount of the same cache.
+    let gets = f.backend.chunk_gets.load(Ordering::SeqCst);
+    assert_eq!(
+        f.state.read(fh, ino, off + 100, 100).await.unwrap(),
+        &data[off as usize + 100..off as usize + 200]
+    );
+    assert_eq!(f.backend.chunk_gets.load(Ordering::SeqCst), gets);
 }
 
 #[tokio::test]

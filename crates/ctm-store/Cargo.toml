@@ -13,6 +13,7 @@ ctm-core.workspace = true
 async-trait.workspace = true
 blake3.workspace = true
 bytes.workspace = true
+futures.workspace = true
 hex.workspace = true
 object_store.workspace = true
 rusqlite.workspace = true

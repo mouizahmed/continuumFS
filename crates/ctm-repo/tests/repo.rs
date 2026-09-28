@@ -15,6 +15,7 @@ use ctm_core::{CommitKind, Id};
 use ctm_repo::{BranchName, Error, Identity, InitOutcome, RefSpec, Repo};
 use ctm_store::faulty::Faults;
 use ctm_store::{Backend, ETag, FaultyBackend, FileBackend, MemBackend, PutMode};
+use futures::StreamExt;
 
 fn identity() -> Identity {
     Identity {
@@ -929,4 +930,89 @@ async fn loose_objects_from_before_packs_are_still_read() {
     .unwrap();
     let read: Chunk = repo.get(&enc.id).await.unwrap();
     assert_eq!(read.0, chunk.0);
+}
+
+/// The chunks of a file on `main`, in order (reading the list and pages learns their hints).
+async fn chunks_of(repo: &Repo, path: &str) -> Vec<ctm_core::ChunkRef> {
+    use ctm_core::{ChunkList, ChunkPage, Content};
+    let root = repo.resolve(&spec("main")).await.unwrap().root_tree;
+    let entry = repo
+        .entry_at(root, Some(path.as_bytes()))
+        .await
+        .unwrap()
+        .unwrap();
+    let Content::ChunkList(list) = entry.content else {
+        panic!("{path} isn't chunked");
+    };
+    let mut out = Vec::new();
+    for p in repo.get::<ChunkList>(&list).await.unwrap().pages {
+        out.extend(repo.get::<ChunkPage>(&p.id).await.unwrap().chunks);
+    }
+    out
+}
+
+#[tokio::test]
+async fn chunks_stored_side_by_side_come_with_one_get_per_span() {
+    let src = tempfile::tempdir().unwrap();
+    let data = random_bytes(6, 40 << 20);
+    fs::write(src.path().join("big"), &data).unwrap();
+    let be = Arc::new(Counting::default());
+    repo_on(be.clone())
+        .await
+        .import(src.path(), &name("main"), "")
+        .await
+        .unwrap();
+    let reader = Repo::open(be.clone(), identity()).await.unwrap();
+    let chunks = chunks_of(&reader, "big").await;
+    assert!(chunks.len() > 20);
+    be.reset();
+    let ids: Vec<Id> = chunks.iter().map(|c| c.id).collect();
+    let mut fetched: std::collections::HashMap<Id, Vec<u8>> = reader
+        .fetch_chunks(&ids, 16 << 20)
+        .map(|(id, chunk)| (id, chunk.unwrap().0))
+        .collect()
+        .await;
+    let joined: Vec<u8> = ids
+        .iter()
+        .flat_map(|id| fetched.remove(id).unwrap())
+        .collect();
+    assert_eq!(joined, data);
+    // 40 MiB in spans of at most 16 MiB, plus one more where the data pack filled at 32 MiB.
+    let gets = be.counts()[0];
+    assert!((3..=5).contains(&gets), "{gets} GETs");
+}
+
+#[tokio::test]
+async fn part_of_a_chunk_is_one_ranged_get() {
+    use ctm_core::{Chunk, Encoded};
+    let src = tempfile::tempdir().unwrap();
+    let data = random_bytes(7, 3 << 20);
+    fs::write(src.path().join("big"), &data).unwrap();
+    let be = Arc::new(Counting::default());
+    repo_on(be.clone())
+        .await
+        .import(src.path(), &name("main"), "")
+        .await
+        .unwrap();
+    let reader = Repo::open(be.clone(), identity()).await.unwrap();
+    let chunks = chunks_of(&reader, "big").await;
+    let c = chunks[1];
+    let start = u64::from(chunks[0].len) as usize;
+    be.reset();
+    let got = reader.chunk_range(&c.id, 1000..70_000).await.unwrap();
+    assert_eq!(&got[..], &data[start + 1000..start + 70_000]);
+    assert_eq!(be.counts()[0], 1);
+    // A chunk from before packs: a range of its loose object.
+    let loose = Chunk(random_bytes(8, 100_000));
+    let enc = Encoded::new(reader.key(), &loose);
+    be.inner
+        .put(
+            &format!("chunks/{}", enc.id),
+            enc.to_stored().into(),
+            PutMode::Overwrite,
+        )
+        .await
+        .unwrap();
+    let got = reader.chunk_range(&enc.id, 5..10).await.unwrap();
+    assert_eq!(&got[..], &loose.0[5..10]);
 }

@@ -73,7 +73,17 @@ pub trait Backend: Send + Sync + 'static {
         }
         Ok(body.slice(start..end))
     }
+
+    /// Bytes `range` of an object as they arrive, for reading many objects out of a pack
+    /// without waiting for all of them. The default fetches the range in one piece.
+    async fn get_range_stream(&self, key: &str, range: std::ops::Range<u64>) -> Result<ByteStream> {
+        let body = self.get_range(key, range).await?;
+        Ok(Box::pin(futures::stream::once(async move { Ok(body) })))
+    }
 }
+
+/// A body arriving in pieces.
+pub type ByteStream = futures::stream::BoxStream<'static, Result<Bytes>>;
 
 /// Opens the backend for a repo URL: `s3://bucket/prefix` (AWS S3, or any S3-compatible
 /// service when `endpoint` is set) or `file:///path`.

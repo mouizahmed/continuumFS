@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use ctm_store::faulty::Faults;
 use ctm_store::{Backend, ETag, Error, FaultyBackend, FileBackend, MemBackend, PutMode};
+use futures::TryStreamExt;
 
 fn b(s: &str) -> Bytes {
     Bytes::copy_from_slice(s.as_bytes())
@@ -86,6 +87,21 @@ async fn conformance(be: Arc<dyn Backend>) {
     assert_eq!(be.get_range("packs/p", 7..7).await.unwrap(), b(""));
     assert!(matches!(
         be.get_range("packs/missing", 0..1).await,
+        Err(Error::NotFound(_))
+    ));
+    // The same ranges, arriving in pieces.
+    for (range, want) in [(2..5, "234"), (0..10, "0123456789"), (7..7, "")] {
+        let pieces: Vec<Bytes> = be
+            .get_range_stream("packs/p", range)
+            .await
+            .unwrap()
+            .try_collect()
+            .await
+            .unwrap();
+        assert_eq!(pieces.concat(), want.as_bytes());
+    }
+    assert!(matches!(
+        be.get_range_stream("packs/missing", 0..1).await.map(|_| ()),
         Err(Error::NotFound(_))
     ));
     be.delete("packs/p").await.unwrap();

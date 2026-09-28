@@ -20,13 +20,17 @@ use ctm_repo::{BranchName, BranchRef, RefSpec, Repo};
 use ctm_store::ETag;
 
 use crate::db::{self, WorkDb};
-use crate::fetch::{FetchError, Fetcher};
+use crate::fetch::{FetchError, Fetcher, READAHEAD_SPAN};
 use crate::inode::{Inodes, Node, ROOT};
 use crate::{Errno, Error, FsResult, Result};
 
-/// Readahead window, in chunks: where it starts once a handle reads sequentially, and its cap.
-const READAHEAD_START: u64 = 4;
-const READAHEAD_MAX: u64 = 16;
+/// Readahead window, in bytes past the chunk being read: where it starts once a handle reads
+/// sequentially, and its cap. It doubles each time the reader moves on to a new chunk.
+const READAHEAD_START: u64 = 2 << 20;
+const READAHEAD_MAX: u64 = 128 << 20;
+/// A read this close to where the handle's reads have got to still counts as sequential: the
+/// kernel sends a file's readahead as several reads at once, and they can arrive out of order.
+const SEQUENTIAL_SLACK: u64 = 1 << 20;
 /// Trees fetched at once by the background metadata walk.
 const WALK_CONCURRENCY: usize = 32;
 
@@ -179,7 +183,7 @@ struct Handle {
     ino: u64,
     next_offset: u64,
     sequential: u32,
-    /// Readahead window in chunks; 0 until the handle reads sequentially.
+    /// Readahead window in bytes; 0 until the handle reads sequentially.
     window: u64,
     last_chunk: Option<u64>,
     /// Chunks up to this global index have been handed to readahead.
@@ -385,6 +389,7 @@ impl MountState {
             opts.max_concurrency,
         )?);
         let empty_tree = Id::compute(repo.key(), ObjectType::Tree, &Tree::default().encode());
+        fetcher.spawn_flusher();
         let branch = match &spec.target {
             RefTarget::Branch(b) => Some(b.clone()),
             _ => None,
@@ -846,10 +851,13 @@ impl MountState {
         if let Content::Inline(b) = &view.entry.content {
             return Ok(b[offset as usize..end as usize].to_vec());
         }
+        let sequential = self.access(fh, offset, end);
         let (bytes, layout, last) = self
-            .read_chunks(&view.entry.content, view.base_len, offset, end)
+            .read_chunks(&view.entry.content, view.base_len, offset, end, sequential)
             .await?;
-        self.readahead(fh, layout, offset, end, last);
+        if sequential {
+            self.readahead(fh, &layout, last);
+        }
         Ok(bytes)
     }
 
@@ -910,9 +918,10 @@ impl MountState {
     ) -> FsResult<Vec<u8>> {
         match content {
             Content::Inline(b) => Ok(b[offset as usize..end as usize].to_vec()),
-            Content::Chunk(_) | Content::ChunkList(_) => {
-                Ok(self.read_chunks(content, base_len, offset, end).await?.0)
-            }
+            Content::Chunk(_) | Content::ChunkList(_) => Ok(self
+                .read_chunks(content, base_len, offset, end, true)
+                .await?
+                .0),
             _ => Err(Errno::EISDIR),
         }
     }
@@ -1036,13 +1045,15 @@ impl MountState {
         })
     }
 
-    /// Bytes `[offset, end)` of a chunked file, and the position of the last chunk read.
+    /// Bytes `[offset, end)` of a chunked file, and the position of the last chunk read. `whole`
+    /// fetches whole chunks on a miss, rather than just the 64 KiB blocks read.
     async fn read_chunks(
         &self,
         content: &Content,
         base_len: u64,
         offset: u64,
         end: u64,
+        whole: bool,
     ) -> FsResult<(Vec<u8>, Arc<Layout>, Pos)> {
         let layout = self.layout(content, base_len).await?;
         let mut out = vec![0; (end - offset) as usize];
@@ -1051,16 +1062,9 @@ impl MountState {
         let last = loop {
             let (start, chunk) = self.page(&layout, pos.page).await?[pos.index];
             let take_end = end.min(start + u64::from(chunk.len));
-            let bytes = self.fetcher.chunk(chunk, false).await.map_err(eio)?;
-            bytes
-                .read_at(
-                    &mut out[(at - offset) as usize..(take_end - offset) as usize],
-                    at - start,
-                )
-                .map_err(|e| {
-                    tracing::error!("reading cached chunk {}: {e}", chunk.id);
-                    Errno::EIO
-                })?;
+            let range = (at - start) as u32..(take_end - start) as u32;
+            let bytes = self.fetcher.read(chunk, range, whole).await.map_err(eio)?;
+            out[(at - offset) as usize..(take_end - offset) as usize].copy_from_slice(&bytes);
             at = take_end;
             if at >= end {
                 break pos;
@@ -1078,70 +1082,99 @@ impl MountState {
         if let Ok(pos) = self.locate(&layout, offset).await
             && let Ok(chunks) = self.page(&layout, pos.page).await
         {
-            self.fetcher.prefetch_chunk(chunks[pos.index].1);
+            self.fetcher.prefetch(vec![chunks[pos.index].1]);
         }
     }
 
-    /// Updates the handle's sequential-read state and starts downloading the chunks ahead.
+    /// Records a read on a handle, and says whether the handle is reading sequentially: two
+    /// reads after the first that each start near where the handle's reads have got to. A read
+    /// anywhere else starts over.
+    fn access(&self, fh: Fh, offset: u64, end: u64) -> bool {
+        let mut handles = self.handles.lock().unwrap();
+        let Some(h) = handles.get_mut(&fh.0) else {
+            return false;
+        };
+        if offset.abs_diff(h.next_offset) <= SEQUENTIAL_SLACK {
+            h.sequential += 1;
+            h.next_offset = h.next_offset.max(end);
+        } else {
+            *h = Handle {
+                ino: h.ino,
+                next_offset: end,
+                ..Handle::default()
+            };
+        }
+        h.sequential >= 2
+    }
+
+    /// Grows a sequential handle's readahead window and starts downloading the chunks in it
+    /// that aren't coming yet, in batches of at most one pack span each.
     ///
-    /// Two reads that each continue where the last ended mark the handle sequential. The
-    /// window starts at 4 chunks and doubles each time the reader moves on to a new chunk,
-    /// up to 16. A read anywhere else resets it.
-    fn readahead(&self, fh: Fh, layout: Arc<Layout>, offset: u64, end: u64, last: Pos) {
-        let (from, to) = {
+    /// The window starts at 2 MiB past the chunk being read and doubles each time the reader
+    /// moves on to a new chunk, up to 128 MiB. Only chunks of pages already loaded are fetched;
+    /// the next page is loaded by the read that reaches it.
+    fn readahead(&self, fh: Fh, layout: &Layout, last: Pos) {
+        let batches = {
             let mut handles = self.handles.lock().unwrap();
             let Some(h) = handles.get_mut(&fh.0) else {
                 return;
             };
-            if offset == h.next_offset {
-                h.sequential += 1;
-            } else {
-                *h = Handle {
-                    ino: h.ino,
-                    ..Handle::default()
-                };
-            }
-            h.next_offset = end;
             let chunk = last.global();
-            if h.sequential >= 2 {
-                if h.window == 0 {
-                    h.window = READAHEAD_START;
-                } else if h.last_chunk.is_some_and(|c| chunk > c) {
-                    h.window = (h.window * 2).min(READAHEAD_MAX);
-                }
-            }
-            h.last_chunk = Some(chunk);
             if h.window == 0 {
-                return;
+                h.window = READAHEAD_START;
+            } else if h.last_chunk.is_some_and(|c| chunk > c) {
+                h.window = (h.window * 2).min(READAHEAD_MAX);
             }
-            let to = chunk + h.window;
+            h.last_chunk = Some(h.last_chunk.map_or(chunk, |c| c.max(chunk)));
             let from = h.prefetched_to.map_or(chunk, |p| p.max(chunk)) + 1;
-            if from > to {
-                return;
-            }
-            h.prefetched_to = Some(to);
-            (from, to)
-        };
-        let fetcher = self.fetcher.clone();
-        let pages: Vec<(usize, PageChunks)> = layout
-            .pages
-            .iter()
-            .enumerate()
-            .filter_map(|(i, p)| p.chunks.get().map(|c| (i, c.clone())))
-            .collect();
-        tokio::spawn(async move {
-            for g in from..=to {
+            // Chunks in the window not handed out yet, and whether the window reaches past
+            // the chunks known (end of file, or a page not loaded yet).
+            let mut todo: Vec<(u64, ChunkRef)> = Vec::new();
+            let (mut ahead, mut g, mut ended) = (0u64, chunk + 1, false);
+            while ahead < h.window {
                 let (page, index) = (g as usize / PAGE_MAX, g as usize % PAGE_MAX);
-                // A page not loaded yet is loaded by the next read that needs it.
-                let Some((_, chunks)) = pages.iter().find(|(i, _)| *i == page) else {
+                let Some(c) = layout
+                    .pages
+                    .get(page)
+                    .and_then(|p| p.chunks.get())
+                    .and_then(|chunks| chunks.get(index))
+                    .map(|(_, c)| *c)
+                else {
+                    ended = true;
                     break;
                 };
-                let Some((_, c)) = chunks.get(index) else {
-                    break;
-                };
-                fetcher.prefetch_chunk(*c);
+                ahead += u64::from(c.len);
+                if g >= from {
+                    todo.push((g, c));
+                }
+                g += 1;
             }
-        });
+            // Whole spans only, so each GET covers as much of a pack as it can. A partial span
+            // waits for the window to grow, unless nothing is on its way yet (the start of a
+            // stream) or it's all there is.
+            let idle = h.prefetched_to.is_none_or(|p| p <= chunk);
+            let mut batches: Vec<Vec<ChunkRef>> = Vec::new();
+            let mut batch_bytes = 0u64;
+            for (_, c) in &todo {
+                if batches.is_empty() || batch_bytes + u64::from(c.len) > READAHEAD_SPAN {
+                    batches.push(Vec::new());
+                    batch_bytes = 0;
+                }
+                batches.last_mut().expect("just pushed").push(*c);
+                batch_bytes += u64::from(c.len);
+            }
+            if !(idle || ended) && batch_bytes < READAHEAD_SPAN {
+                batches.pop();
+            }
+            let handed: usize = batches.iter().map(Vec::len).sum();
+            if handed > 0 {
+                h.prefetched_to = Some(todo[handed - 1].0);
+            }
+            batches
+        };
+        for batch in batches {
+            self.fetcher.prefetch(batch);
+        }
     }
 
     pub async fn readlink(&self, ino: u64) -> FsResult<Vec<u8>> {

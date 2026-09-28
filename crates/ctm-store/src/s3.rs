@@ -3,12 +3,13 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::TryStreamExt;
 use object_store::aws::{AmazonS3, AmazonS3Builder, S3ConditionalPut};
 use object_store::list::{PaginatedListOptions, PaginatedListStore};
 use object_store::path::Path;
-use object_store::{ObjectStore, ObjectStoreExt, PutOptions, UpdateVersion};
+use object_store::{GetOptions, GetRange, ObjectStore, ObjectStoreExt, PutOptions, UpdateVersion};
 
-use crate::{Backend, ETag, Error, PutMode, Result};
+use crate::{Backend, ByteStream, ETag, Error, PutMode, Result};
 
 pub struct S3Backend {
     store: AmazonS3,
@@ -152,6 +153,22 @@ impl Backend for S3Backend {
         }
         match self.store.get_range(&self.path(key), range).await {
             Ok(b) => Ok(b),
+            Err(object_store::Error::NotFound { .. }) => Err(Error::NotFound(key.to_string())),
+            Err(e) => Err(store_error(e)),
+        }
+    }
+
+    async fn get_range_stream(&self, key: &str, range: std::ops::Range<u64>) -> Result<ByteStream> {
+        if range.is_empty() {
+            let body = self.get_range(key, range).await?;
+            return Ok(Box::pin(futures::stream::once(async move { Ok(body) })));
+        }
+        let options = GetOptions {
+            range: Some(GetRange::Bounded(range)),
+            ..GetOptions::default()
+        };
+        match self.store.get_opts(&self.path(key), options).await {
+            Ok(r) => Ok(Box::pin(r.into_stream().map_err(store_error))),
             Err(object_store::Error::NotFound { .. }) => Err(Error::NotFound(key.to_string())),
             Err(e) => Err(store_error(e)),
         }

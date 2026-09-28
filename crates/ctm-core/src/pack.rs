@@ -26,7 +26,7 @@ const INDEX_MAGIC: &[u8; 8] = b"CTMIDX01";
 /// A pack is closed once it reaches this size.
 pub const PACK_TARGET: usize = 32 << 20;
 /// Bytes before an entry's payload.
-const ENTRY_HEADER: usize = 14;
+pub const ENTRY_HEADER: usize = 14;
 pub const HINT_LEN: usize = 24;
 const TRAILER_ENTRY: usize = 32 + 4 + 4 + 4 + 1 + 1;
 const INDEX_ENTRY: usize = 32 + 16 + 4 + 4 + 1;
