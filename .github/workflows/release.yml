@@ -30,7 +30,7 @@ jobs:
       - name: Check that the binary is static and runs
         run: |
           bin=target/${{ matrix.target }}/release/ctm
-          file "$bin" | grep -q 'statically linked'
+          file "$bin" | grep -Eq 'statically linked|static-pie linked'
           "$bin" --version
       - name: Package
         run: |

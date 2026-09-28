@@ -3,6 +3,11 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+/// One allocator on every target: musl's (in the static release binaries) is much slower with
+/// many threads allocating chunk-sized buffers.
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod commands;
 mod config;
 mod control;

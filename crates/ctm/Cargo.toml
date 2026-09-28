@@ -14,6 +14,7 @@ ctm-store.workspace = true
 ctm-repo.workspace = true
 ctm-fs.workspace = true
 clap.workspace = true
+mimalloc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
