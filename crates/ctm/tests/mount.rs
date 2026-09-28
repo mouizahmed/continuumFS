@@ -869,11 +869,17 @@ fn gc_drops_old_auto_commits_and_deletes_what_only_they_referenced() {
 
     let before = dir_bytes(&bucket);
     let first = env.ok(&["gc", "--grace-secs", "0"]);
-    assert!(first.contains("Retention: 1 auto-commit dropped"), "{first}");
+    assert!(
+        first.contains("Retention: 1 auto-commit dropped"),
+        "{first}"
+    );
     let second_run = env.ok(&["gc", "--grace-secs", "0"]);
     assert!(second_run.contains("Deleted:"), "{second_run}");
     let after = dir_bytes(&bucket);
-    assert!(before - after >= 3 << 20, "{before} → {after}\n{second_run}");
+    assert!(
+        before - after >= 3 << 20,
+        "{before} → {after}\n{second_run}"
+    );
     assert!(env.run(&["cat", "main:v.bin"]).stdout == second);
     assert_eq!(env.ok(&["fsck"]).trim(), "No problems found");
     assert_eq!(env.ok(&["fsck", "main"]).trim(), "No problems found");
