@@ -203,10 +203,16 @@ v0.2 fixes the last two (below); sequential throughput is next on the roadmap.
 Repos written by v0.1 are still read by v0.2, and are upgraded to format version 2 on their first
 write, after which v0.1 refuses them.
 
-**Since v0.2** (unreleased, on `main`): random reads download only the 64 KiB blocks they touch,
-and sequential reads stream whole pack spans. A cold sequential read of 10 GiB went from 40 MB/s
-to 100 MB/s (mountpoint-s3: 115 MB/s in the same session), and 200 random 4 KiB reads from
-312 MiB downloaded and 88 ms p50 to 13 MiB and 46 ms ([details](bench/results/r4-reads.md)).
+**Since v0.2** (unreleased, on `main`):
+
+- Random reads download only the 64 KiB blocks they touch, and sequential reads stream whole
+  pack spans. A cold sequential read of 10 GiB went from 40 MB/s to 100 MB/s (mountpoint-s3:
+  115 MB/s in the same session), and 200 random 4 KiB reads from 312 MiB downloaded and 88 ms p50
+  to 13 MiB and 46 ms ([details](bench/results/r4-reads.md)).
+- Commits are local and pushed in the background, and mounts commit on their own after 5 s of
+  quiet. Committing a clone plus `node_modules` went from 18.1 s to 2.9 s; committing 1 GiB of
+  new data from 52.7 s to 16.1 s, and a write during that commit no longer waits for the upload
+  ([details](bench/results/r2-local-commits.md)).
 
 ## Development
 

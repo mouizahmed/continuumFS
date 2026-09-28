@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # v0 baseline benchmarks: the "before" numbers for the roadmap.
 #
-#   bench/baseline.sh [all|fork|head|seqread|randread|append|npm|linux|linuxgit|gitremount|history|ttfb]
+#   bench/baseline.sh [all|fork|head|seqread|randread|append|npm|linux|linuxgit|gitremount|history|ttfb|writepush]
 #
 # BENCH_RESULTS appends to another results file (for a roadmap item's "after" run),
 # LINUX_BRANCH imports the kernel into another branch (so a new format is measured from scratch),
@@ -245,7 +245,7 @@ bench_append() {
   out=$("$CTM" commit "$MNT" -m append)
   local took
   took=$(secs "$t0" "$EPOCHREALTIME")
-  record "6. Append 1 byte to a 20 GiB file, then commit" \
+  record "6. Append 1 byte to a 20 GiB file, then commit ($("$CTM" --version))" \
     "commit $took s; downloaded $(mib "$(fetched)"); ${out#*(}"
   unmount_all
 }
@@ -289,7 +289,43 @@ bench_npm() {
   t0=$EPOCHREALTIME
   local out
   out=$("$CTM" commit "$MNT" -m "npm ci")
-  record "5. Commit the clone + node_modules" "$(secs "$t0" "$EPOCHREALTIME") s; ${out#*(}"
+  record "5. Commit the clone + node_modules ($("$CTM" --version))" "$(secs "$t0" "$EPOCHREALTIME") s; ${out#*(}"
+  if has_sync; then
+    t0=$EPOCHREALTIME
+    "$CTM" sync "$MNT" >/dev/null
+    record "5. ... then \`ctm sync\` until it's pushed" "$(secs "$t0" "$EPOCHREALTIME") s"
+  fi
+  unmount_all
+}
+
+# Whether this build commits locally and has `ctm sync` (R2 on).
+has_sync() { "$CTM" sync --help >/dev/null 2>&1; }
+
+# R2. Writes while a large commit is pushed: write 1 GiB of fresh random data (nothing in the
+# bucket to dedup against), commit, and 1 s into the commit write 256 MiB more (fsync'd). Before
+# R2 a commit blocks writes until its upload is done.
+bench_writepush() {
+  local branch=writepush-$RANDOM
+  mkdir -p "$WORK/empty"
+  "$CTM" import "$WORK/empty" --branch "$branch" >/dev/null
+  "$CTM" mount "$branch" "$MNT" >/dev/null
+  head -c 1G /dev/urandom >"$MNT/a.bin"
+  local t0=$EPOCHREALTIME
+  "$CTM" commit "$MNT" >/dev/null &
+  local committing=$!
+  sleep 1
+  local t1=$EPOCHREALTIME
+  head -c 256M /dev/urandom | dd of="$MNT/b.bin" bs=1M iflag=fullblock conv=fsync status=none
+  local t2=$EPOCHREALTIME
+  wait "$committing"
+  local t3=$EPOCHREALTIME
+  local pushed=""
+  if has_sync; then
+    "$CTM" sync "$MNT" >/dev/null
+    pushed="; pushed $(secs "$t0" "$EPOCHREALTIME") s after the commit started"
+  fi
+  record "R2. Commit 1 GiB, and write 256 MiB 1 s into it ($("$CTM" --version))" \
+    "commit returned after $(secs "$t0" "$t3") s; the write took $(secs "$t1" "$t2") s$pushed"
   unmount_all
 }
 
@@ -394,6 +430,6 @@ bench_gitremount() {
 setup
 case ${1:-all} in
   all) bench_fork; bench_head; bench_seqread; bench_append; bench_npm; bench_linux; bench_linuxgit ;;
-  fork | head | seqread | append | npm | linux | linuxgit | gitremount | history | ttfb | randread) "bench_$1" ;;
-  *) echo "usage: $0 [all|fork|head|seqread|randread|append|npm|linux|linuxgit|gitremount|history|ttfb]" >&2; exit 2 ;;
+  fork | head | seqread | append | npm | linux | linuxgit | gitremount | history | ttfb | randread | writepush) "bench_$1" ;;
+  *) echo "usage: $0 [all|fork|head|seqread|randread|append|npm|linux|linuxgit|gitremount|history|ttfb|writepush]" >&2; exit 2 ;;
 esac
