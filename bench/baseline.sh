@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # v0 baseline benchmarks: the "before" numbers for the roadmap.
 #
-#   bench/baseline.sh [all|fork|head|seqread|append|npm|linux|linuxgit|gitremount|history|ttfb]
+#   bench/baseline.sh [all|fork|head|seqread|randread|append|npm|linux|linuxgit|gitremount|history|ttfb]
 #
 # BENCH_RESULTS appends to another results file (for a roadmap item's "after" run),
 # LINUX_BRANCH imports the kernel into another branch (so a new format is measured from scratch),
-# and BENCH_PREFIX uses another repo in the same bucket (with its own local state), for builds
-# whose formats differ.
+# BENCH_PREFIX uses another repo in the same bucket (with its own local state), for builds
+# whose formats differ, and SEQ_BRANCH reads the 10 GiB file from another branch (imported on
+# first use from a directory holding only that file).
 #
 # Needs a bucket and an env file (BENCH_ENV, default ~/.config/continuum/bench.env) setting
 # AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, CTM_BENCH_URL (s3://bucket/prefix), and
@@ -140,6 +141,22 @@ data() {
   fi
 }
 
+# The branch seqread and randread use: `data`, or SEQ_BRANCH holding only seq10.bin.
+SEQ_BRANCH=${SEQ_BRANCH:-data}
+seq_branch() {
+  data
+  [ "$SEQ_BRANCH" = data ] && return
+  if ! "$CTM" branch list | grep -qx "$SEQ_BRANCH"; then
+    mkdir -p "$WORK/seq10"
+    ln -f "$WORK/data/seq10.bin" "$WORK/seq10/seq10.bin"
+    log "importing seq10.bin into $SEQ_BRANCH"
+    local t0=$EPOCHREALTIME
+    local out
+    out=$("$CTM" import "$WORK/seq10" --branch "$SEQ_BRANCH")
+    record "Import a 10 GiB file into $SEQ_BRANCH" "$(secs "$t0" "$EPOCHREALTIME") s; ${out#*; }"
+  fi
+}
+
 # 2. Bytes downloaded for `head -c 1M` on a 20 GiB file.
 bench_head() {
   data
@@ -160,13 +177,14 @@ cold_read() {
 # 3. Cold sequential read of 10 GiB: Continuum, rclone mount, mountpoint-s3
 # (SEQREAD_TOOLS picks which).
 bench_seqread() {
-  data
+  seq_branch
   for tool in ${SEQREAD_TOOLS:-ctm rclone mount-s3}; do
     case $tool in
       ctm)
         cold_cache
-        "$CTM" mount data "$MNT" --read-only >/dev/null
-        record "3. Cold sequential read of 10 GiB: ctm" "$(cold_read "$MNT/seq10.bin")"
+        "$CTM" mount "$SEQ_BRANCH" "$MNT" --read-only >/dev/null
+        record "3. Cold sequential read of 10 GiB: ctm ($("$CTM" --version), $SEQ_BRANCH)" \
+          "$(cold_read "$MNT/seq10.bin"); downloaded $(mib "$(fetched)")"
         unmount_all
         ;;
       rclone)
@@ -182,6 +200,35 @@ bench_seqread() {
         ;;
     esac
   done
+}
+
+# R4. Cold random reads: 200 reads of 4 KiB at random offsets of the 10 GiB file, one at a time,
+# with empty caches. Latency percentiles and bytes downloaded.
+bench_randread() {
+  seq_branch
+  cold_cache
+  "$CTM" mount "$SEQ_BRANCH" "$MNT" --read-only >/dev/null
+  local lat
+  lat=$(python3 - "$MNT/seq10.bin" <<'EOF'
+import os, random, sys, time
+fd = os.open(sys.argv[1], os.O_RDONLY)
+size = os.fstat(fd).st_size
+rng = random.Random(4)
+times = []
+for _ in range(200):
+    off = rng.randrange(0, size - 4096) & ~4095
+    t0 = time.perf_counter()
+    assert len(os.pread(fd, 4096, off)) == 4096
+    times.append(time.perf_counter() - t0)
+times.sort()
+p = lambda q: times[int(q * (len(times) - 1))] * 1000
+print(f"p50 {p(0.5):.0f} ms, p90 {p(0.9):.0f} ms, p99 {p(0.99):.0f} ms")
+EOF
+)
+  sleep 2 # let readahead that already started finish, so it's counted
+  record "R4. Cold random 4 KiB reads of a 10 GiB file, 200 reads ($("$CTM" --version), $SEQ_BRANCH)" \
+    "$lat; downloaded $(mib "$(fetched)")"
+  unmount_all
 }
 
 # 6. Append 1 byte to the 20 GiB file and commit.
@@ -347,6 +394,6 @@ bench_gitremount() {
 setup
 case ${1:-all} in
   all) bench_fork; bench_head; bench_seqread; bench_append; bench_npm; bench_linux; bench_linuxgit ;;
-  fork | head | seqread | append | npm | linux | linuxgit | gitremount | history | ttfb) "bench_$1" ;;
-  *) echo "usage: $0 [all|fork|head|seqread|append|npm|linux|linuxgit|gitremount|history|ttfb]" >&2; exit 2 ;;
+  fork | head | seqread | append | npm | linux | linuxgit | gitremount | history | ttfb | randread) "bench_$1" ;;
+  *) echo "usage: $0 [all|fork|head|seqread|randread|append|npm|linux|linuxgit|gitremount|history|ttfb]" >&2; exit 2 ;;
 esac
