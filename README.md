@@ -217,6 +217,10 @@ write, after which v0.1 refuses them.
   new data from 52.7 s to 16.1 s, and a write during that commit no longer waits for the upload
   ([details](bench/results/r2-local-commits.md)).
 
+**Since v0.3** (unreleased, on `main`): `ctm gc` collects garbage. After 10 edit cycles of a
+100 MiB file, the bucket went from 1,000.9 MiB to 100.0 MiB in two runs
+([details](bench/results/r6-gc.md)); `ctm fsck` verifies what's left.
+
 ## Development
 
 ```sh

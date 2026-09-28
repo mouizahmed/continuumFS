@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # v0 baseline benchmarks: the "before" numbers for the roadmap.
 #
-#   bench/baseline.sh [all|fork|head|seqread|randread|append|npm|linux|linuxgit|gitremount|history|ttfb|writepush]
+#   bench/baseline.sh [all|fork|head|seqread|randread|append|npm|linux|linuxgit|gitremount|history|ttfb|writepush|gc]
 #
 # BENCH_RESULTS appends to another results file (for a roadmap item's "after" run),
 # LINUX_BRANCH imports the kernel into another branch (so a new format is measured from scratch),
@@ -403,6 +403,38 @@ bench_history() {
   record "History: $("$CTM" branch list | grep -c '^hist-') pushes" "done"
 }
 
+# R6. Storage after N edit cycles: overwrite a 100 MiB file with new data CYCLES times (default
+# 10), each version auto-committed and pushed, then run `ctm gc` twice (the second deletes what
+# the first listed; retention and the grace period set to zero for the benchmark). Run it with
+# BENCH_PREFIX set to a prefix of its own: GC collects the whole repo.
+bench_gc() {
+  [ -n "${BENCH_PREFIX:-}" ] || { echo "run bench_gc with BENCH_PREFIX set" >&2; exit 2; }
+  local cfg=$XDG_CONFIG_HOME/continuum/config.toml
+  sed -i -e 's/^quiet_secs = .*/quiet_secs = 1/' -e 's/^auto_days = .*/auto_days = 0/' "$cfg"
+  local branch=cycles-$RANDOM
+  mkdir -p "$WORK/empty"
+  "$CTM" import "$WORK/empty" --branch "$branch" >/dev/null
+  "$CTM" mount "$branch" "$MNT" >/dev/null
+  local cycles=${CYCLES:-10}
+  for ((i = 1; i <= cycles; i++)); do
+    head -c 100M /dev/urandom >"$MNT/model.bin"
+    until "$CTM" status "$MNT" | grep -q "Changes: 0"; do sleep 0.5; done
+    "$CTM" sync "$MNT" >/dev/null
+  done
+  unmount_all
+  local size
+  size() { rclone size "r2:$BUCKET/$BENCH_PREFIX" --json | sed -E 's/.*"bytes":([0-9]+).*/\1/'; }
+  local before
+  before=$(size)
+  local t0=$EPOCHREALTIME
+  "$CTM" gc --grace-secs 0 >/dev/null
+  local t1=$EPOCHREALTIME
+  "$CTM" gc --grace-secs 0 >/dev/null
+  local t2=$EPOCHREALTIME
+  record "R6. Bucket after $cycles edit cycles of a 100 MiB file, then two \`ctm gc\` runs ($("$CTM" --version))" \
+    "$(mib "$before") → $(mib "$(size)"); gc runs $(secs "$t0" "$t1") s and $(secs "$t1" "$t2") s"
+}
+
 # R9. `git status` on a fresh mount of a repo whose index was last refreshed in a mount.
 GIT_REPO=${GIT_REPO:-https://github.com/git/git}
 bench_gitremount() {
@@ -430,6 +462,6 @@ bench_gitremount() {
 setup
 case ${1:-all} in
   all) bench_fork; bench_head; bench_seqread; bench_append; bench_npm; bench_linux; bench_linuxgit ;;
-  fork | head | seqread | append | npm | linux | linuxgit | gitremount | history | ttfb | randread | writepush) "bench_$1" ;;
-  *) echo "usage: $0 [all|fork|head|seqread|randread|append|npm|linux|linuxgit|gitremount|history|ttfb|writepush]" >&2; exit 2 ;;
+  fork | head | seqread | append | npm | linux | linuxgit | gitremount | history | ttfb | randread | writepush | gc) "bench_$1" ;;
+  *) echo "usage: $0 [all|fork|head|seqread|randread|append|npm|linux|linuxgit|gitremount|history|ttfb|writepush|gc]" >&2; exit 2 ;;
 esac
