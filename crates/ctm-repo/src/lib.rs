@@ -15,7 +15,7 @@ pub use objects::{Uploaded, object_key};
 pub use refs::{BranchName, BranchRef, ForkedFrom, SnapshotRef};
 pub use refspec::RefSpec;
 pub use repo::{Identity, Imported, InitOutcome, PathChange, Repo, Resolved, new_file_id};
-pub use time::rfc3339;
+pub use time::{now_ns, rfc3339};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

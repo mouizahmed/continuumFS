@@ -26,6 +26,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use ctm_core::encoding::VerifyError;
 use ctm_core::pack::{
     Entry, Listed, Location, PACK_TARGET, PackBuilder, PackId, decode_index, encode_index,
+    read_trailer,
 };
 use ctm_core::{Encoded, Id, ObjectType, RepoKey};
 use ctm_store::{Backend, PutMode};
@@ -87,6 +88,8 @@ struct Open {
     uploading: usize,
     /// Finished packs whose upload failed, retried by the next `put` or `flush`.
     failed: Vec<Sealed>,
+    /// Outgoing mode: packs sealed to local files and not yet pushed, by ID, in sealing order.
+    local: Vec<(PackId, std::path::PathBuf, Vec<Listed>)>,
 }
 
 /// `index.db`: the mirror of the bucket's index segments, and the hints learned from reads.
@@ -289,6 +292,23 @@ pub(crate) struct Objects {
     pack_uploads: tokio::sync::Semaphore,
     uploaded_objects: AtomicU64,
     uploaded_bytes: AtomicU64,
+    /// Outgoing mode (mounts): full packs go to local files here instead of the bucket, and are
+    /// pushed by `flush`.
+    outgoing: Option<std::path::PathBuf>,
+}
+
+/// Writes a sealed pack to `dir/<pack-id>.pack` durably: a temporary file, fsync, rename, and
+/// an fsync of the directory.
+fn write_local(dir: &Path, pack: PackId, bytes: &[u8]) -> std::io::Result<std::path::PathBuf> {
+    use std::io::Write;
+    let path = dir.join(format!("{pack}.pack"));
+    let tmp = dir.join(format!("{pack}.tmp"));
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, &path)?;
+    std::fs::File::open(dir)?.sync_all()?;
+    Ok(path)
 }
 
 fn new_pack() -> PackBuilder {
@@ -317,7 +337,124 @@ impl Objects {
             pack_uploads: tokio::sync::Semaphore::new(PACK_UPLOADS),
             uploaded_objects: AtomicU64::new(0),
             uploaded_bytes: AtomicU64::new(0),
+            outgoing: None,
         })
+    }
+
+    /// Switches to outgoing mode with packs kept in `dir`, and takes over the packs a previous
+    /// process sealed there but didn't push. A file that isn't a whole pack was being written
+    /// when that process died, before anything referenced it, and is deleted.
+    pub fn set_outgoing(&mut self, dir: &Path) -> Result<()> {
+        std::fs::create_dir_all(dir)?;
+        let mut found = Vec::new();
+        for f in std::fs::read_dir(dir)? {
+            let path = f?.path();
+            if path.extension().is_some_and(|e| e == "pack")
+                && let Ok((pack, entries)) = read_trailer(&std::fs::read(&path)?)
+                && !entries.is_empty()
+            {
+                found.push((pack, path, entries));
+            } else {
+                std::fs::remove_file(&path)?;
+            }
+        }
+        let open = self.open.get_mut().unwrap();
+        for (_, _, entries) in &found {
+            for (id, ty, loc) in entries {
+                open.located.insert(*id, (*ty, *loc));
+            }
+        }
+        open.local = found;
+        self.outgoing = Some(dir.to_path_buf());
+        Ok(())
+    }
+
+    /// Whether anything is sealed locally or open and not yet pushed (outgoing mode).
+    pub fn has_unpushed(&self) -> bool {
+        let open = self.open.lock().unwrap();
+        !open.local.is_empty() || open.data.is_some() || open.meta.is_some()
+    }
+
+    /// Outgoing mode: writes the open packs to local files, durably. Everything added so far is
+    /// then safe on this machine, to be pushed by `flush`.
+    pub async fn seal(&self) -> Result<()> {
+        let dir = self.outgoing.clone().expect("seal is for outgoing mode");
+        let packs: Vec<Sealed> = {
+            let mut open = self.open.lock().unwrap();
+            [open.data.take(), open.meta.take()]
+                .into_iter()
+                .flatten()
+                .map(PackBuilder::finish)
+                .collect()
+        };
+        for sealed in packs {
+            self.keep_local(&dir, sealed).await?;
+        }
+        Ok(())
+    }
+
+    async fn keep_local(&self, dir: &Path, (bytes, entries): Sealed) -> Result<()> {
+        let pack = entries[0].2.pack;
+        let dir = dir.to_path_buf();
+        let path = tokio::task::spawn_blocking(move || write_local(&dir, pack, &bytes))
+            .await
+            .expect("the write doesn't panic")?;
+        let mut open = self.open.lock().unwrap();
+        for (id, _, _) in &entries {
+            open.pending.remove(id);
+        }
+        open.local.push((pack, path, entries));
+        Ok(())
+    }
+
+    /// The local file of a pack sealed in outgoing mode and not yet pushed.
+    fn local_file(&self, pack: PackId) -> Option<std::path::PathBuf> {
+        let open = self.open.lock().unwrap();
+        open.local
+            .iter()
+            .find(|(p, _, _)| *p == pack)
+            .map(|(_, path, _)| path.clone())
+    }
+
+    /// A pack's bytes `range` as they arrive: from its local file while it's waiting to be
+    /// pushed, else a streamed ranged GET.
+    pub async fn pack_stream(
+        &self,
+        pack: &Location,
+        data: bool,
+        range: std::ops::Range<u64>,
+    ) -> Result<ctm_store::ByteStream> {
+        if self.local_file(pack.pack).is_some() {
+            let bytes = self.pack_range(pack, data, range).await?;
+            return Ok(Box::pin(stream::once(async move { Ok(bytes) })));
+        }
+        self.get_range_stream(&pack.key(data), range).await
+    }
+
+    /// Bytes `range` of a pack: from its local file while it's waiting to be pushed, else from
+    /// the bucket (also if the file went away because the pack was just pushed).
+    pub async fn pack_range(
+        &self,
+        pack: &Location,
+        data: bool,
+        range: std::ops::Range<u64>,
+    ) -> Result<Bytes> {
+        if let Some(path) = self.local_file(pack.pack) {
+            let read = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+                use std::os::unix::fs::FileExt;
+                let mut buf = vec![0; (range.end - range.start) as usize];
+                std::fs::File::open(path)?.read_exact_at(&mut buf, range.start)?;
+                Ok(buf)
+            })
+            .await
+            .expect("the read doesn't panic");
+            match read {
+                Ok(buf) => return Ok(Bytes::from(buf)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        self.get_range(&pack.key(data), range).await
     }
 
     pub fn uploaded(&self) -> Uploaded {
@@ -399,10 +536,20 @@ impl Objects {
                 open.located.insert(obj.id, (obj.ty, loc));
                 open.pending.insert(obj.id, obj);
             }
-            full.append(&mut open.failed);
-            open.uploading += full.len();
+            if self.outgoing.is_none() {
+                full.append(&mut open.failed);
+                open.uploading += full.len();
+            }
         }
-        self.upload_packs(full).await
+        match &self.outgoing {
+            Some(dir) => {
+                for sealed in full {
+                    self.keep_local(dir, sealed).await?;
+                }
+                Ok(())
+            }
+            None => self.upload_packs(full).await,
+        }
     }
 
     /// Uploads finished packs. Each must already be counted in `Open::uploading`.
@@ -445,6 +592,9 @@ impl Objects {
     /// points at an object that isn't in an indexed pack.
     pub async fn flush(&self) -> Result<()> {
         let _guard = self.flushing.lock().await;
+        if self.outgoing.is_some() {
+            return self.push_local().await;
+        }
         let packs = {
             let mut open = self.open.lock().unwrap();
             let mut packs: Vec<_> = [open.data.take(), open.meta.take()]
@@ -490,6 +640,53 @@ impl Objects {
         for (id, _, _) in &entries {
             open.located.remove(id);
             known.insert(*id);
+        }
+        Ok(())
+    }
+
+    /// Outgoing mode's flush: seals the open packs, uploads every local pack (4 at a time), then
+    /// an index segment for them, and only then deletes the local files.
+    async fn push_local(&self) -> Result<()> {
+        self.seal().await?;
+        let local: Vec<(PackId, std::path::PathBuf, Vec<Listed>)> =
+            self.open.lock().unwrap().local.clone();
+        if local.is_empty() {
+            return Ok(());
+        }
+        let uploads: Vec<(std::path::PathBuf, Listed)> = local
+            .iter()
+            .map(|(_, path, entries)| (path.clone(), entries[0]))
+            .collect();
+        stream::iter(uploads)
+            .map(|(path, (_, ty, loc))| async move {
+                let bytes = tokio::fs::read(&path).await?;
+                let _slot = self.pack_uploads.acquire().await.expect("never closed");
+                self.put_counted(&loc.key(ty.is_data()), bytes).await
+            })
+            .buffer_unordered(PACK_UPLOADS)
+            .try_collect::<Vec<()>>()
+            .await?;
+        let entries: Vec<Listed> = local.iter().flat_map(|(_, _, e)| e.clone()).collect();
+        let mut seg = [0u8; 16];
+        getrandom::fill(&mut seg).expect("the OS random source works");
+        let key = format!("index/{}", hex::encode(seg));
+        self.put_counted(&key, encode_index(&entries)).await?;
+        self.index.insert(&key, &entries)?;
+        {
+            let mut open = self.open.lock().unwrap();
+            let mut known = self.known.lock().unwrap();
+            open.local
+                .retain(|(p, _, _)| !local.iter().any(|(q, _, _)| q == p));
+            for (id, _, _) in &entries {
+                open.located.remove(id);
+                known.insert(*id);
+            }
+        }
+        for (_, path, _) in &local {
+            match std::fs::remove_file(path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
         }
         Ok(())
     }
@@ -579,10 +776,7 @@ impl Objects {
 
     /// Reads one pack entry.
     async fn read_entry(&self, id: &Id, data: bool, loc: &Location) -> Result<Fetched> {
-        let bytes = {
-            let _permit = self.requests.acquire().await.expect("never closed");
-            self.backend.get_range(&loc.key(data), loc.range()).await?
-        };
+        let bytes = self.pack_range(loc, data, loc.range()).await?;
         let entry = Entry::parse(&bytes).map_err(|e| Error::Corrupt {
             id: *id,
             source: VerifyError::Decode(e),

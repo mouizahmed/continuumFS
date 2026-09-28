@@ -1,8 +1,10 @@
 //! `state.db`: a mount's working state, persisted so it survives a crash of the mount
 //! process (SQLite, WAL, `synchronous=NORMAL`; `fsync` upgrades one commit to FULL).
 //!
-//! - `meta`: the branch, the base commit, ref, and ETag, and `pending_commit`/`pending_ref`
-//!   while a commit's ref update is in flight;
+//! - `meta`: the branch; the local head the mount shows (`base_commit`, `base_root`); the last
+//!   pushed ref and its ETag; and `pending_commit`/`pending_ref`/`pending_seq` while a push's
+//!   ref update is in flight;
+//! - `pending`: commits made locally and not yet pushed, oldest first (R2);
 //! - `inodes`: every changed entry and its ancestors;
 //! - `whiteouts`: base entries that were deleted or renamed away;
 //! - `extents`: the dirty byte ranges of each file.
@@ -13,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
-use ctm_core::{Content, DirEntry, Id};
+use ctm_core::{CommitKind, Content, DirEntry, Id};
 
 use crate::Result;
 use crate::inode::Node;
@@ -72,7 +74,10 @@ impl WorkDb {
                  parent INTEGER NOT NULL, name BLOB NOT NULL, PRIMARY KEY (parent, name));
              CREATE TABLE IF NOT EXISTS extents (
                  ino INTEGER NOT NULL, start INTEGER NOT NULL, end INTEGER NOT NULL,
-                 PRIMARY KEY (ino, start));",
+                 PRIMARY KEY (ino, start));
+             CREATE TABLE IF NOT EXISTS pending (
+                 seq INTEGER PRIMARY KEY AUTOINCREMENT, commit_id TEXT NOT NULL,
+                 kind INTEGER NOT NULL, message TEXT NOT NULL, time_ns INTEGER NOT NULL);",
         )?;
         // Working state written by v0.1 has no file_id column.
         let has_file_id: bool = conn
@@ -84,7 +89,8 @@ impl WorkDb {
         Ok(WorkDb { conn })
     }
 
-    /// Whether a state directory holds uncommitted changes (or a commit in flight).
+    /// Whether a state directory holds uncommitted changes, unpushed commits, or a push in
+    /// flight.
     pub fn has_changes(state_dir: &Path) -> Result<bool> {
         if !state_dir.join("state.db").exists() {
             return Ok(false);
@@ -93,6 +99,7 @@ impl WorkDb {
         let count = |sql: &str| -> Result<i64> { Ok(db.conn.query_row(sql, [], |r| r.get(0))?) };
         Ok(count("SELECT COUNT(*) FROM inodes")? > 0
             || count("SELECT COUNT(*) FROM whiteouts")? > 0
+            || count("SELECT COUNT(*) FROM pending")? > 0
             || db.meta("pending_commit")?.is_some())
     }
 
@@ -120,6 +127,44 @@ impl WorkDb {
         });
         self.conn.execute_batch("PRAGMA synchronous = NORMAL")?;
         r
+    }
+
+    /// Commits made locally and not yet pushed, oldest first.
+    pub fn pending(&self) -> Result<Vec<PendingCommit>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT seq, commit_id, kind, message, time_ns FROM pending ORDER BY seq")?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(seq, id, kind, message, time_ns)| {
+                let bad = || {
+                    crate::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("bad pending commit {seq} in state.db"),
+                    ))
+                };
+                Ok(PendingCommit {
+                    seq,
+                    commit: id.parse().map_err(|_| bad())?,
+                    kind: u8::try_from(kind)
+                        .ok()
+                        .and_then(CommitKind::from_u8)
+                        .ok_or_else(bad)?,
+                    message,
+                    time_ns,
+                })
+            })
+            .collect()
     }
 
     pub fn load(&self) -> Result<Loaded> {
@@ -174,6 +219,36 @@ impl WorkDb {
         }
         Ok((rows, whiteouts, extents))
     }
+}
+
+/// A commit made locally, waiting to be pushed.
+#[derive(Clone, Debug)]
+pub struct PendingCommit {
+    pub seq: i64,
+    pub commit: Id,
+    pub kind: CommitKind,
+    pub message: String,
+    pub time_ns: i64,
+}
+
+pub fn add_pending(
+    t: &Transaction<'_>,
+    commit: &Id,
+    kind: CommitKind,
+    message: &str,
+    time_ns: i64,
+) -> Result<()> {
+    t.execute(
+        "INSERT INTO pending (commit_id, kind, message, time_ns) VALUES (?1, ?2, ?3, ?4)",
+        params![commit.to_hex(), i64::from(kind as u8), message, time_ns],
+    )?;
+    Ok(())
+}
+
+/// Drops the pending commits up to and including `seq`, once they're pushed.
+pub fn drop_pending(t: &Transaction<'_>, seq: i64) -> Result<()> {
+    t.execute("DELETE FROM pending WHERE seq <= ?1", [seq])?;
+    Ok(())
 }
 
 pub fn set_meta(t: &Transaction<'_>, key: &str, value: &str) -> Result<()> {

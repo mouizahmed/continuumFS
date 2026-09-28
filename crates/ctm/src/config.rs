@@ -16,6 +16,8 @@ pub struct LocalConfig {
     pub repos: BTreeMap<String, RepoEntry>,
     #[serde(default)]
     pub cache: CacheConfig,
+    #[serde(default)]
+    pub commit: CommitConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,6 +38,24 @@ impl Default for CacheConfig {
     fn default() -> CacheConfig {
         CacheConfig {
             chunks_max: "20GiB".to_string(),
+        }
+    }
+}
+
+/// When mounts commit on their own (R2).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitConfig {
+    /// Commit once a mount has had no writes for this long.
+    pub quiet_secs: u64,
+    /// Commit a mount that has had uncommitted changes for this long, even if writes go on.
+    pub max_dirty_secs: u64,
+}
+
+impl Default for CommitConfig {
+    fn default() -> CommitConfig {
+        CommitConfig {
+            quiet_secs: 5,
+            max_dirty_secs: 60,
         }
     }
 }

@@ -241,6 +241,10 @@ fn a_read_write_mount_commits_and_survives_remounts() {
 
     let out = env.ok(&["commit", &env.path("mnt"), "-m", "edits"]);
     assert!(out.starts_with("Committed"), "{out}");
+    // The commit is local; `ctm sync` waits for the background push.
+    let out = env.ok(&["sync", &env.path("mnt")]);
+    assert!(out.starts_with("Everything is pushed to main"), "{out}");
+    assert!(!env.ok(&["status", &env.path("mnt")]).contains("Unpushed"));
     assert_eq!(env.ok(&["cat", "main:notes.txt"]), "hello\nmore\n");
     assert_eq!(env.ok(&["cat", "main:d/e/f.txt"]), "deep\n");
     assert!(env.run(&["cat", "main:big.bin"]).status.code() != Some(0));
@@ -257,7 +261,7 @@ fn a_read_write_mount_commits_and_survives_remounts() {
 }
 
 #[test]
-fn uncommitted_work_survives_a_killed_mount_and_no_commit_unmounts() {
+fn uncommitted_work_survives_a_killed_mount_and_unpushed_commits_a_no_wait_unmount() {
     if !fuse_available() {
         return;
     }
@@ -270,21 +274,29 @@ fn uncommitted_work_survives_a_killed_mount_and_no_commit_unmounts() {
     // Not fsynced: the bytes sit in staging and the extent map in state.db.
     fs::write(mnt.join("wip.txt"), "work in progress\n").unwrap();
     kill_9(mount_pid(&env));
+    // Another branch can't take over the directory while its changes are uncommitted.
+    env.ok(&["fork", "main", "other"]);
+    let err = env.fails(&["mount", "other", &env.path("mnt")]);
+    assert!(err.contains("uncommitted changes"), "{err}");
     env.ok(&["mount", "main", &env.path("mnt")]);
     assert_eq!(
         fs::read_to_string(mnt.join("wip.txt")).unwrap(),
         "work in progress\n"
     );
 
-    env.ok(&["unmount", "--no-commit", &env.path("mnt")]);
-    assert!(env.run(&["cat", "main:wip.txt"]).status.code() != Some(0));
-    // Another branch can't take over the directory while its changes are uncommitted.
-    env.ok(&["fork", "main", "other"]);
-    let err = env.fails(&["mount", "other", &env.path("mnt")]);
-    assert!(err.contains("uncommitted changes"), "{err}");
+    // `--no-wait` commits and unmounts without waiting for the push; whatever wasn't pushed
+    // yet is pushed by the next mount here.
+    fs::write(mnt.join("more.txt"), "more\n").unwrap();
+    env.ok(&["unmount", "--no-wait", &env.path("mnt")]);
     env.ok(&["mount", "main", &env.path("mnt")]);
     env.ok(&["unmount", &env.path("mnt")]);
     assert_eq!(env.ok(&["cat", "main:wip.txt"]), "work in progress\n");
+    assert_eq!(env.ok(&["cat", "main:more.txt"]), "more\n");
+    assert_eq!(
+        mounts(&env),
+        0,
+        "everything is pushed, so no working state is kept"
+    );
 }
 
 #[test]
@@ -302,11 +314,11 @@ fn two_mounts_of_one_branch_race_and_one_auto_forks() {
     fs::write(a.join("notes.txt"), "from a\n").unwrap();
     fs::write(b.join("notes.txt"), "from b\n").unwrap();
     assert!(env.ok(&["commit", &env.path("a")]).starts_with("Committed"));
-    let out = env.ok(&["commit", &env.path("b")]);
-    assert!(
-        out.contains("main moved on another machine. Your changes are safe on main."),
-        "{out}"
-    );
+    env.ok(&["sync", &env.path("a")]);
+    assert!(env.ok(&["commit", &env.path("b")]).starts_with("Committed"));
+    // b's push loses the race and goes to a fork, which the mount follows.
+    let out = env.ok(&["sync", &env.path("b")]);
+    assert!(out.starts_with("Everything is pushed to main."), "{out}");
     let branches = env.ok(&["branch", "list"]);
     assert_eq!(branches.lines().count(), 2, "{branches}");
     let fork = branches.lines().find(|l| *l != "main").unwrap().to_string();
@@ -529,7 +541,7 @@ fn fsx_random_operations_match_a_model() {
         if op % remount_every == remount_every - 1 {
             drop(file);
             let args: &[&str] = if (op / remount_every) % 2 == 1 {
-                &["unmount", "--no-commit", &env.path("mnt")]
+                &["unmount", "--no-wait", &env.path("mnt")]
             } else {
                 &["unmount", &env.path("mnt")]
             };
@@ -767,5 +779,40 @@ fn git_status_on_a_fresh_mount_reads_no_files() {
         fetched < 200_000,
         "git status downloaded {fetched} bytes: it re-read the files"
     );
+    env.ok(&["unmount", &env.path("mnt")]);
+}
+
+/// R2: a quiet mount commits on its own, and `fork` of a mounted branch first commits and
+/// pushes what's been written there.
+#[test]
+fn quiet_mounts_commit_on_their_own_and_fork_includes_mounted_work() {
+    if !fuse_available() {
+        return;
+    }
+    let env = Env::new();
+    repo_with_main(&env);
+    let config = env.home.join(".config/continuum/config.toml");
+    let text = fs::read_to_string(&config).unwrap();
+    assert!(text.contains("quiet_secs = 5"), "{text}");
+    fs::write(&config, text.replace("quiet_secs = 5", "quiet_secs = 1")).unwrap();
+    let mnt = env.work.join("mnt");
+    fs::create_dir(&mnt).unwrap();
+    env.ok(&["mount", "main", &env.path("mnt")]);
+
+    fs::write(mnt.join("auto.txt"), "committed by itself\n").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !env.ok(&["status", &env.path("mnt")]).contains("Changes: 0") {
+        assert!(std::time::Instant::now() < deadline, "no auto-commit");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    env.ok(&["sync", &env.path("mnt")]);
+    assert_eq!(env.ok(&["cat", "main:auto.txt"]), "committed by itself\n");
+    let log = env.ok(&["log", "main"]);
+    assert_eq!(log.lines().count(), 2, "{log}");
+
+    // Written just now, not committed yet: the fork still has it.
+    fs::write(mnt.join("fresh.txt"), "just written\n").unwrap();
+    env.ok(&["fork", "main", "copy"]);
+    assert_eq!(env.ok(&["cat", "copy:fresh.txt"]), "just written\n");
     env.ok(&["unmount", &env.path("mnt")]);
 }

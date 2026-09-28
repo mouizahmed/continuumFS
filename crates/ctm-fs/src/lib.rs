@@ -11,11 +11,11 @@ mod inode;
 mod state;
 
 pub use state::{
-    Attr, CommitOutcome, DirItem, Fh, FileKind, Invalidate, MountOptions, MountState, SetAttr,
-    StatFs, Status,
+    Attr, CommitOutcome, DirItem, Fh, FileKind, Invalidate, MountOptions, MountState, PushOutcome,
+    SetAttr, StatFs, Status,
 };
 
-/// Whether a mount's working-state directory holds uncommitted changes.
+/// Whether a mount's working-state directory holds uncommitted changes or unpushed commits.
 pub fn has_local_changes(state_dir: &std::path::Path) -> Result<bool> {
     db::WorkDb::has_changes(state_dir)
 }

@@ -6,13 +6,15 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::sync::Arc;
 
-use ctm_fs::{CommitOutcome, Errno, FileKind, MountState, SetAttr};
+use ctm_fs::{CommitOutcome, Errno, FileKind, MountState, PushOutcome, SetAttr};
 use ctm_repo::{BranchName, Repo};
 use ctm_store::faulty::Faults;
 use ctm_store::{Backend, FaultyBackend, MemBackend};
 use proptest::prelude::*;
 
-use common::{Counting, identity, lookup_path, open, random_bytes, read_all, read_fh};
+use common::{
+    Counting, commit_push, identity, lookup_path, open, random_bytes, read_all, read_fh, sync,
+};
 
 fn main_branch() -> BranchName {
     BranchName::new("main").unwrap()
@@ -192,6 +194,7 @@ async fn run_model(base_len: usize, ops: Vec<Op>) {
     }
     assert_eq!(read_fh(&state, fh, ino).await, model, "final contents");
     state.commit("final").await.unwrap();
+    sync(&state).await;
     assert_eq!(
         export(&repo, "main").await["f"],
         model,
@@ -267,8 +270,14 @@ async fn tree_operations_commit_and_survive_a_remount() {
 
     assert!(matches!(
         state.commit("tree ops").await.unwrap(),
-        CommitOutcome::Pushed { .. }
+        CommitOutcome::Committed { .. }
     ));
+    assert_eq!(state.status().await.unwrap().unpushed, 1);
+    assert!(matches!(
+        state.push().await.unwrap(),
+        PushOutcome::Pushed { .. }
+    ));
+    assert_eq!(state.status().await.unwrap().unpushed, 0);
     let files = export(&repo, "main").await;
     let want: BTreeMap<String, Vec<u8>> = [
         ("dir/", &b""[..]),
@@ -318,7 +327,7 @@ async fn rename_replaces_files_and_moves_directories_with_their_contents() {
     state.rename(1, b"src", dst, b"src2", false).await.unwrap();
     let x = lookup_path(&state, "dst/src2/deep/x.txt").await.unwrap();
     assert_eq!(read_all(&state, x).await, b"x");
-    state.commit("renames").await.unwrap();
+    commit_push(&state, "renames").await;
     let files = export(&repo, "main").await;
     assert_eq!(files["b.txt"], b"a");
     assert_eq!(files["dst/src2/deep/x.txt"], b"x");
@@ -335,7 +344,7 @@ async fn an_unlinked_open_file_stays_readable_and_is_not_committed() {
     state.unlink(1, b"tmp").await.unwrap();
     assert_eq!(lookup_path(&state, "tmp").await, Err(Errno::ENOENT));
     assert_eq!(read_fh(&state, fh, a.ino).await, b"scratch");
-    state.commit("").await.unwrap();
+    commit_push(&state, "").await;
     state.release(fh).await.unwrap();
     assert!(!export(&repo, "main").await.contains_key("tmp"));
 }
@@ -351,10 +360,10 @@ async fn two_mounts_race_and_exactly_one_auto_forks() {
     write_file(&laptop, "notes.txt", b"a\n").await;
     write_file(&desktop, "notes.txt", b"b\n").await;
 
-    let first = laptop.commit("laptop").await.unwrap();
-    assert!(matches!(first, CommitOutcome::Pushed { .. }), "{first:?}");
-    let second = desktop.commit("desktop").await.unwrap();
-    let CommitOutcome::AutoForked { branch, .. } = second else {
+    let first = commit_push(&laptop, "laptop").await;
+    assert!(matches!(first, PushOutcome::Pushed { .. }), "{first:?}");
+    let second = commit_push(&desktop, "desktop").await;
+    let PushOutcome::AutoForked { branch, .. } = second else {
         panic!("expected an auto-fork, got {second:?}");
     };
     assert_eq!(branch.as_str(), "main.desktop");
@@ -368,8 +377,8 @@ async fn two_mounts_race_and_exactly_one_auto_forks() {
     // Later commits go to the fork, and the fork's history includes the base.
     write_file(&desktop, "notes.txt", b"c\n").await;
     assert!(matches!(
-        desktop.commit("more").await.unwrap(),
-        CommitOutcome::Pushed { .. }
+        commit_push(&desktop, "more").await,
+        PushOutcome::Pushed { .. }
     ));
     assert_eq!(export(&repo, "main.desktop").await["notes.txt"], b"c\n");
     let log = repo
@@ -390,15 +399,15 @@ async fn behind_is_reported_when_the_branch_moves() {
     let two = open(&repo, d2.path(), "main", false).await;
     assert!(!two.status().await.unwrap().behind);
     write_file(&one, "a", b"2").await;
-    one.commit("").await.unwrap();
+    commit_push(&one, "").await;
     assert!(two.status().await.unwrap().behind);
 }
 
-/// A crash at any point during a commit: after a remount, the branch is at the old or the
-/// new commit, the working state agrees, and committing again never forks against itself.
-/// `lands` makes the crashing PUT reach the bucket first, as when the process dies after the
-/// CAS succeeds but before it records that.
-async fn crash_during_commit(n: usize, lands: bool) -> bool {
+/// A crash at any point during a push: after a remount, the branch is at the old or the new
+/// commit, the queue agrees, and pushing again never forks against itself. `lands` makes the
+/// crashing PUT reach the bucket first, as when the process dies after the CAS succeeds but
+/// before it records that.
+async fn crash_during_push(n: usize, lands: bool) -> bool {
     let backend = Arc::new(FaultyBackend::new(MemBackend::new(), Faults::default()));
     let repo = repo_with(backend.clone(), &[("f", random_bytes(3, 2_000_000))]).await;
     let dir = tempfile::tempdir().unwrap();
@@ -408,6 +417,8 @@ async fn crash_during_commit(n: usize, lands: bool) -> bool {
     let fh = state.open_file(f, true).await.unwrap();
     state.write(fh, f, 1_000_000, b"edit").await.unwrap();
     state.release(fh).await.unwrap();
+    // The commit is local: it needs no network, so it can't be cut short by one.
+    state.commit("crashy").await.unwrap();
     drop(state);
 
     backend.set_faults(Faults {
@@ -417,28 +428,31 @@ async fn crash_during_commit(n: usize, lands: bool) -> bool {
     });
     let crashing = backend.clone();
     let state = open(&repo, dir.path(), "main", false).await;
-    let result = state.commit("crashy").await;
+    let result = state.push().await;
     drop(state);
     crashing.heal();
 
     let case = format!("crash after {n} puts (lands: {lands})");
     let state = open(&repo, dir.path(), "main", false).await;
+    assert_eq!(state.status().await.unwrap().dirty_files, 0, "{case}");
     match &result {
         Ok(outcome) => {
             assert!(
-                matches!(outcome, CommitOutcome::Pushed { .. }),
+                matches!(outcome, PushOutcome::Pushed { .. }),
                 "{case}: {outcome:?}"
             );
-            assert_eq!(state.status().await.unwrap().dirty_files, 0, "{case}");
+            assert_eq!(state.status().await.unwrap().unpushed, 0, "{case}");
         }
         Err(_) => {
-            let again = state.commit("retry").await.unwrap();
+            let again = state.push().await.unwrap();
             assert!(
-                matches!(
-                    again,
-                    CommitOutcome::Pushed { .. } | CommitOutcome::NothingToCommit
-                ),
+                matches!(again, PushOutcome::Pushed { .. }),
                 "{case}: {again:?}"
+            );
+            assert_eq!(
+                state.push().await.unwrap(),
+                PushOutcome::NothingToPush,
+                "{case}"
             );
         }
     }
@@ -455,13 +469,14 @@ async fn crash_during_commit(n: usize, lands: bool) -> bool {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_crash_at_any_put_during_commit_recovers_without_a_fork() {
+async fn a_crash_at_any_put_during_a_push_recovers_without_a_fork() {
     for lands in [false, true] {
         let mut n = 0;
-        while !crash_during_commit(n, lands).await {
+        while !crash_during_push(n, lands).await {
             n += 1;
         }
-        assert!(n > 3, "the commit should take several puts");
+        // A data pack, a meta pack, an index segment, and the ref.
+        assert!(n >= 3, "the push should take several puts");
     }
 }
 
@@ -482,7 +497,7 @@ async fn appending_one_byte_downloads_at_most_one_chunk() {
     );
     state.write(fh, ino, big.len() as u64, b"!").await.unwrap();
     state.release(fh).await.unwrap();
-    state.commit("append").await.unwrap();
+    commit_push(&state, "append").await;
     assert!(
         counting.chunk_gets() <= 1,
         "{} chunks downloaded",
@@ -504,12 +519,12 @@ async fn restore_brings_back_a_path_from_a_ref() {
     let f = lookup_path(&state, "f").await.unwrap();
     assert_eq!(read_all(&state, f).await, b"original");
     write_file(&state, "f", b"changed again").await;
-    state.commit("").await.unwrap();
+    commit_push(&state, "").await;
     let import = repo.log(&"main".parse().unwrap(), None).await.unwrap();
     let import = import.last().unwrap().commit.to_hex();
     state.restore(b"f", &import.parse().unwrap()).await.unwrap();
     assert_eq!(read_all(&state, f).await, b"original");
-    state.commit("restored").await.unwrap();
+    commit_push(&state, "restored").await;
     assert_eq!(export(&repo, "main").await["f"], b"original");
 }
 
@@ -558,10 +573,11 @@ impl Backend for RefOutage {
     }
 }
 
-/// When a commit's ref update fails and the ref can't be read either, the running mount
-/// refuses writes (reads still work) until the next commit settles what happened.
+/// When a push's ref update fails and the ref can't be read either, nothing stops: reads and
+/// writes go on, commits queue up locally, and once the network is back the next pushes find
+/// out what happened and publish everything, without forking.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_unknown_commit_outcome_blocks_writes_until_the_next_commit() {
+async fn a_push_with_no_answer_blocks_nothing_and_is_settled_later() {
     use std::sync::atomic::Ordering::SeqCst;
     for lands in [false, true] {
         let backend = Arc::new(RefOutage::default());
@@ -573,30 +589,29 @@ async fn an_unknown_commit_outcome_blocks_writes_until_the_next_commit() {
         backend.fail_ref_puts.store(true, SeqCst);
         backend.land_failed_puts.store(lands, SeqCst);
         backend.fail_ref_gets.store(true, SeqCst);
-        assert!(state.commit("lost").await.is_err());
+        state.commit("lost").await.unwrap();
+        assert!(state.push().await.is_err());
         let f = lookup_path(&state, "f").await.unwrap();
         assert_eq!(read_all(&state, f).await, b"edited", "reads keep working");
         let fh = state.open_file(f, true).await.unwrap();
-        assert_eq!(
-            state.write(fh, f, 0, b"x").await,
-            Err(Errno::EIO),
-            "lands: {lands}"
-        );
-        assert_eq!(state.mkdir(1, b"d", 0o755).await.err(), Some(Errno::EIO));
-
-        // The network is back: the next commit finds out and unblocks writes.
-        backend.fail_ref_puts.store(false, SeqCst);
-        backend.fail_ref_gets.store(false, SeqCst);
-        let outcome = state.commit("retry").await.unwrap();
-        assert!(
-            matches!(outcome, CommitOutcome::Pushed { .. }),
-            "lands: {lands}: {outcome:?}"
-        );
-        assert_eq!(export(&repo, "main").await["f"], b"edited");
         state.write(fh, f, 0, b"E").await.unwrap();
         state.release(fh).await.unwrap();
-        state.commit("after").await.unwrap();
+        state.commit("while offline").await.unwrap();
+        assert_eq!(state.status().await.unwrap().unpushed, 2);
+
+        // The network is back: pushing settles the first attempt, then publishes the rest.
+        backend.fail_ref_puts.store(false, SeqCst);
+        backend.fail_ref_gets.store(false, SeqCst);
+        sync(&state).await;
+        assert_eq!(state.status().await.unwrap().unpushed, 0);
         assert_eq!(export(&repo, "main").await["f"], b"Edited");
+        let log = repo.log(&"main".parse().unwrap(), None).await.unwrap();
+        let messages: Vec<_> = log.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            ["while offline", "lost", "import"],
+            "lands: {lands}"
+        );
         assert_eq!(
             repo.list_branches().await.unwrap().len(),
             1,
@@ -648,7 +663,7 @@ async fn inode_numbers_are_file_ids_and_survive_remounts_and_renames() {
         .await
         .unwrap();
     assert_eq!(lookup_path(&one, "dir/moved.txt").await.unwrap(), a);
-    one.commit("r9").await.unwrap();
+    commit_push(&one, "r9").await;
     drop(one);
 
     let (_d2, two) = fresh(&repo).await;
@@ -657,7 +672,7 @@ async fn inode_numbers_are_file_ids_and_survive_remounts_and_renames() {
     assert_eq!(lookup_path(&two, "dir").await.unwrap(), dir);
     // Editing a file keeps its number too.
     write_file(&two, "new.txt", b"edited").await;
-    two.commit("edit").await.unwrap();
+    commit_push(&two, "edit").await;
     drop(two);
     let (_d3, three) = fresh(&repo).await;
     assert_eq!(lookup_path(&three, "new.txt").await.unwrap(), new);
@@ -753,8 +768,8 @@ async fn format_1_entries_get_file_ids_when_their_directory_is_committed() {
         "format-1 entries get per-mount numbers"
     );
     write_file(&one, "touch.txt", b"new").await;
-    one.commit("first v2 commit").await.unwrap();
-    assert_eq!(repo.format_version(), 2);
+    commit_push(&one, "first v2 commit").await;
+    assert_eq!(one.repo().format_version(), 2);
     // The kernel keeps the number it knows until the entry is looked up fresh.
     assert_eq!(lookup_path(&one, "keep.txt").await.unwrap(), keep);
     drop(one);

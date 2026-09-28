@@ -57,21 +57,23 @@ enum Command {
         #[arg(long)]
         foreground: bool,
     },
-    /// Commit, then unmount
+    /// Commit, wait for the push, then unmount
     Unmount {
         dir: PathBuf,
-        /// Unmount without committing; the working state is kept for the next mount
+        /// Don't wait for the push; unpushed commits are pushed by the next mount here
         #[arg(long)]
-        no_commit: bool,
+        no_wait: bool,
     },
-    /// Commit a mount's changes and push them
+    /// Commit a mount's changes (locally; they're pushed in the background)
     Commit {
         dir: PathBuf,
         #[arg(short, long, default_value = "")]
         message: String,
     },
-    /// Show a mount's branch, base commit, dirty files, and whether it is behind
+    /// Show a mount's branch, base commit, changes, unpushed commits, and whether it is behind
     Status { dir: PathBuf },
+    /// Wait until a mount (or every read-write mount) has pushed every commit made so far
+    Sync { dir: Option<PathBuf> },
     /// Create a new branch from any ref
     Fork { from: String, new: String },
     #[command(subcommand)]
@@ -185,7 +187,8 @@ async fn run(command: Command) -> Result<()> {
         } => mount::mount(&spec, &dir, read_only, foreground).await,
         Command::MountProcess { state_dir } => mount::run(state_dir).await,
         Command::Cache(CacheCommand::Stats { json }) => mount::cache_stats(json).await,
-        Command::Unmount { dir, no_commit } => mount::unmount(&dir, no_commit).await,
+        Command::Unmount { dir, no_wait } => mount::unmount(&dir, no_wait).await,
+        Command::Sync { dir } => mount::sync_cmd(dir.as_deref()).await,
         Command::Commit { dir, message } => mount::commit_cmd(&dir, &message).await,
         Command::Status { dir } => mount::status(&dir).await,
         Command::Restore { path, at } => mount::restore(&path, &at).await,

@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
-use ctm_fs::{CommitOutcome, MountOptions, MountState, fuse};
+use ctm_fs::{CommitOutcome, MountOptions, MountState, PushOutcome, fuse};
 use ctm_repo::{RefSpec, refspec::RefTarget};
 
 use crate::Result;
@@ -161,7 +161,8 @@ fn parse_size(s: &str) -> Result<u64> {
     Ok(n * mult)
 }
 
-/// Whether a mount's working state should outlive it: read-write, with uncommitted changes.
+/// Whether a mount's working state should outlive it: read-write, with uncommitted changes or
+/// unpushed commits.
 fn keeps_state(record: &MountRecord) -> bool {
     !record.read_only && ctm_fs::has_local_changes(&record.state_dir()).unwrap_or(true)
 }
@@ -190,8 +191,8 @@ pub async fn mount(spec: &str, dir: &Path, read_only: bool, foreground: bool) ->
             reuse = Some(old);
         } else {
             return Err(format!(
-                "{} has uncommitted changes for {}; mount that branch there to commit them, \
-                 or delete {} to discard them",
+                "{} has uncommitted changes or unpushed commits for {}; mount that branch there \
+                 to commit and push them, or delete {} to discard them",
                 mountpoint.display(),
                 old.spec,
                 old.state_dir().display()
@@ -261,7 +262,12 @@ pub async fn run(state_dir: PathBuf) -> Result<()> {
     record.save()?;
     let config = load_config()?;
     let backend = ctm_store::open(&record.repo.url, record.repo.endpoint.as_deref())?;
-    let repo = Arc::new(open_at(backend, identity(&config)?).await?);
+    let mut repo = open_at(backend, identity(&config)?).await?;
+    if !record.read_only {
+        // Commits write their objects here; the pusher uploads them.
+        repo = repo.with_outgoing(&state_dir.join("outgoing"))?;
+    }
+    let repo = Arc::new(repo);
     let opts = MountOptions {
         read_only: record.read_only,
         chunk_cache_max: parse_size(&config.cache.chunks_max)?,
@@ -285,6 +291,18 @@ pub async fn run(state_dir: PathBuf) -> Result<()> {
         record.spec = branch.to_string();
         record.save()?;
     }
+    let background = if state.read_only() {
+        Vec::new()
+    } else {
+        vec![
+            tokio::spawn(push_loop(state.clone(), state_dir.clone())),
+            tokio::spawn(auto_commit_loop(
+                state.clone(),
+                Duration::from_secs(config.commit.quiet_secs),
+                Duration::from_secs(config.commit.max_dirty_secs),
+            )),
+        ]
+    };
     let adapter = fuse::FuseAdapter::new(state.clone(), tokio::runtime::Handle::current());
     let session = fuse::spawn(adapter, &record.mountpoint, state.read_only())?;
     fuse::connect_notifier(&session, &state);
@@ -333,6 +351,10 @@ pub async fn run(state_dir: PathBuf) -> Result<()> {
     }
     // The kernel has let go of the mount, so the session ends; wait for it.
     tokio::task::spawn_blocking(move || session.join()).await??;
+    for task in background {
+        task.abort();
+        let _ = task.await;
+    }
     drop(state);
     if !keeps_state(&record) {
         fs::remove_dir_all(&state_dir)?;
@@ -350,29 +372,87 @@ fn error(message: impl std::fmt::Display) -> Response {
     }
 }
 
-/// Commits, and follows an auto-fork in `mount.json`.
-async fn commit(state: &MountState, record: &mut MountRecord, message: &str) -> Response {
-    let before = state.repo().uploaded();
-    let result = state.commit(message).await;
-    let up = state.repo().uploaded() - before;
-    let uploaded = format!("uploaded {} objects, {}", up.objects, human(up.bytes));
-    match result {
-        Ok(CommitOutcome::Pushed { commit }) => ok(format!(
-            "Committed {} to {} ({uploaded})",
-            &commit.to_hex()[..12],
-            record.spec
-        )),
-        Ok(CommitOutcome::AutoForked { from, branch, .. }) => {
-            record.spec = branch.to_string();
-            if let Err(e) = record.save() {
-                tracing::warn!("updating mount.json: {e}");
+/// Pushes whatever is committed, in the background, for as long as the mount runs: right
+/// after each commit, and after a failure with exponential backoff (200 ms, doubling to 30 s,
+/// with jitter, no limit). Follows an auto-fork in `mount.json`.
+async fn push_loop(state: Arc<MountState>, state_dir: PathBuf) {
+    let mut backoff = Duration::from_millis(200);
+    loop {
+        match state.push().await {
+            Ok(PushOutcome::NothingToPush) => {
+                backoff = Duration::from_millis(200);
+                state.wait_for_commits().await;
             }
-            ok(format!(
-                "{from} moved on another machine. Your changes are safe on {branch}. ({uploaded})"
-            ))
+            Ok(PushOutcome::Pushed { .. }) => backoff = Duration::from_millis(200),
+            Ok(PushOutcome::AutoForked { from, branch, .. }) => {
+                backoff = Duration::from_millis(200);
+                tracing::warn!(
+                    "{from} moved on another machine. Your changes are safe on {branch}."
+                );
+                match MountRecord::load(&state_dir) {
+                    Ok(mut record) => {
+                        record.spec = branch.to_string();
+                        if let Err(e) = record.save() {
+                            tracing::warn!("updating mount.json: {e}");
+                        }
+                    }
+                    Err(e) => tracing::warn!("updating mount.json: {e}"),
+                }
+            }
+            Err(e) => {
+                tracing::warn!("push failed, retrying in {backoff:?}: {e}");
+                let jitter = Duration::from_millis(u64::from(std::process::id() % 97));
+                tokio::time::sleep(backoff + jitter).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
         }
+    }
+}
+
+/// Commits on its own once the mount has been quiet for `quiet`, or dirty for `max_dirty`.
+async fn auto_commit_loop(state: Arc<MountState>, quiet: Duration, max_dirty: Duration) {
+    loop {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if state.commit_due(quiet, max_dirty)
+            && let Err(e) = state.auto_commit().await
+        {
+            tracing::warn!("auto-commit failed: {e}");
+        }
+    }
+}
+
+fn branch_of(state: &MountState, record: &MountRecord) -> String {
+    state
+        .branch()
+        .map_or_else(|| record.spec.clone(), |b| b.to_string())
+}
+
+async fn commit(state: &MountState, record: &MountRecord, message: &str) -> Response {
+    match state.commit(message).await {
+        Ok(CommitOutcome::Committed { commit }) => ok(format!(
+            "Committed {} on {} (pushing in the background; `ctm sync` waits for it)",
+            &commit.to_hex()[..12],
+            branch_of(state, record)
+        )),
         Ok(CommitOutcome::NothingToCommit) => ok("Nothing to commit".into()),
         Err(e) => error(format!("commit failed: {e}")),
+    }
+}
+
+/// Commits the working state if asked, then waits until everything is pushed.
+async fn sync(state: &MountState, record: &MountRecord, commit_first: bool) -> Response {
+    if commit_first
+        && !state.read_only()
+        && let Err(e) = state.auto_commit().await
+    {
+        return error(format!("commit failed: {e}"));
+    }
+    match state.wait_pushed().await {
+        Ok(()) => ok(format!(
+            "Everything is pushed to {}",
+            branch_of(state, record)
+        )),
+        Err(e) => error(e),
     }
 }
 
@@ -397,6 +477,14 @@ async fn handle(
                     lines.push("Read-only".into());
                 } else {
                     lines.push(format!("Changes: {}", s.dirty_files));
+                    if let Some(oldest) = s.oldest_unpushed_ns {
+                        let age = (ctm_repo::now_ns() - oldest).max(0) / 1_000_000_000;
+                        lines.push(format!(
+                            "Unpushed: {} commit{}, the oldest {age} s ago",
+                            s.unpushed,
+                            if s.unpushed == 1 { "" } else { "s" }
+                        ));
+                    }
                 }
                 if s.behind
                     && let Some(b) = &s.branch
@@ -420,19 +508,16 @@ async fn handle(
                 Err(e) => (error(e), false),
             }
         }
-        Request::Unmount {
-            commit: wants_commit,
-        } => {
-            if *wants_commit
-                && !state.read_only()
-                && let Response::Error { message } = commit(state, record, "").await
-            {
-                return (
-                    error(format!(
-                        "{message}; still mounted (retry, or pass --no-commit)"
-                    )),
-                    false,
-                );
+        Request::Sync { commit } => (sync(state, record, *commit).await, false),
+        Request::Unmount { wait } => {
+            if !state.read_only() {
+                // Committing is local, so it only fails on a local problem.
+                if let Err(e) = state.auto_commit().await {
+                    return (error(format!("commit failed: {e}; still mounted")), false);
+                }
+                if *wait && let Response::Error { message } = sync(state, record, false).await {
+                    return (error(format!("{message}; still mounted")), false);
+                }
             }
             // The kernel can report a mount busy for a moment after its last file closes.
             let mut result = fusermount(&record.mountpoint, false);
@@ -506,6 +591,31 @@ pub async fn commit_cmd(dir: &Path, message: &str) -> Result<()> {
     Ok(())
 }
 
+/// `ctm sync`: waits until the mount at `dir` (or every read-write mount) has pushed every
+/// commit made so far.
+pub async fn sync_cmd(dir: Option<&Path>) -> Result<()> {
+    let targets = match dir {
+        Some(d) => vec![mount_at(d)?],
+        None => records().into_iter().filter(|r| !r.read_only).collect(),
+    };
+    for record in targets {
+        println!("{}", call(&record, &Request::Sync { commit: false }).await?);
+    }
+    Ok(())
+}
+
+/// Before `fork` or `snapshot` reads `branch` from the bucket: every mount of it on this
+/// machine commits and pushes, so the new ref includes what's been written there.
+pub async fn sync_branch(branch: &str) -> Result<()> {
+    for record in records() {
+        if record.read_only || record.spec != branch || !alive(&record).await {
+            continue;
+        }
+        call(&record, &Request::Sync { commit: true }).await?;
+    }
+    Ok(())
+}
+
 pub async fn status(dir: &Path) -> Result<()> {
     println!("{}", call(&mount_at(dir)?, &Request::Status).await?);
     Ok(())
@@ -532,7 +642,7 @@ pub async fn restore(path: &Path, at: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn unmount(dir: &Path, no_commit: bool) -> Result<()> {
+pub async fn unmount(dir: &Path, no_wait: bool) -> Result<()> {
     let mountpoint = absolute(dir)?;
     let Some(record) = find_record(&mountpoint) else {
         if is_mounted(&mountpoint) {
@@ -542,7 +652,7 @@ pub async fn unmount(dir: &Path, no_commit: bool) -> Result<()> {
         }
         return Err(format!("{} is not a ctm mount", mountpoint.display()).into());
     };
-    match control::call(&record.socket(), &Request::Unmount { commit: !no_commit }).await {
+    match control::call(&record.socket(), &Request::Unmount { wait: !no_wait }).await {
         Ok(Response::Ok { message }) => {
             // Wait for the mount process to finish unmounting and exit.
             let pid = MountRecord::load(&record.state_dir())
@@ -559,8 +669,9 @@ pub async fn unmount(dir: &Path, no_commit: bool) -> Result<()> {
             }
             println!("{message}");
             if keeps_state(&record) && record.state_dir().exists() {
+                let record = MountRecord::load(&record.state_dir()).unwrap_or(record);
                 println!(
-                    "Uncommitted changes are kept for the next `ctm mount {}` here",
+                    "Unpushed commits are kept, and pushed by the next `ctm mount {}` here",
                     record.spec
                 );
             }
@@ -571,7 +682,7 @@ pub async fn unmount(dir: &Path, no_commit: bool) -> Result<()> {
             clear_stale(&mountpoint)?;
             if keeps_state(&record) {
                 println!(
-                    "Cleared a stale mount at {}; its uncommitted changes are kept for the next `ctm mount {}` there",
+                    "Cleared a stale mount at {}; its uncommitted changes and unpushed commits are kept for the next `ctm mount {}` there",
                     mountpoint.display(),
                     record.spec
                 );

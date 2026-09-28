@@ -10,10 +10,22 @@ use tokio::net::UnixStream;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
-    Commit { message: String },
+    Commit {
+        message: String,
+    },
     Status,
-    Restore { path: String, at: String },
-    Unmount { commit: bool },
+    Restore {
+        path: String,
+        at: String,
+    },
+    /// Waits until every commit is pushed; `commit` commits the working state first.
+    Sync {
+        commit: bool,
+    },
+    /// Commits, waits for the push unless `wait` is false, then unmounts.
+    Unmount {
+        wait: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

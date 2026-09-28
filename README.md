@@ -55,8 +55,8 @@ $ ctm status ~/ws
 Branch: main
 Base commit: ec2814422370
 Changes: 1
-$ ctm commit ~/ws -m "first edit"
-Committed 21dbac144e8c to main (uploaded 3 objects, 290 B)
+$ ctm commit ~/ws -m "first edit"                  # local and instant; pushed in the background
+Committed 21dbac144e8c on main (pushing in the background; `ctm sync` waits for it)
 
 $ ctm fork main experiment                         # a new branch: one request
 $ mkdir ~/exp && ctm mount experiment ~/exp
@@ -64,7 +64,7 @@ $ rm ~/exp/notes.txt && ctm commit ~/exp -m "remove notes"
 $ ctm diff main experiment
 removed: notes.txt
 $ ctm log experiment
-$ ctm unmount ~/exp && ctm unmount ~/ws            # unmount commits anything left
+$ ctm unmount ~/exp && ctm unmount ~/ws            # unmount commits and pushes anything left
 ```
 
 ### With a real bucket
@@ -96,8 +96,9 @@ ctm export <ref>[:path] <dir>                write a ref (or a path in it) to a 
 ctm ls <ref>[:path]    ctm cat <ref>:<path>
 
 ctm mount <ref> <dir> [--read-only] [--foreground]
-ctm unmount <dir> [--no-commit]              commits first unless --no-commit
-ctm commit <dir> [-m msg]
+ctm unmount <dir> [--no-wait]                commits, and waits for the push unless --no-wait
+ctm commit <dir> [-m msg]                    commit now (mounts also commit on their own)
+ctm sync [<dir>]                             wait until every commit is pushed
 ctm status <dir>
 ctm restore <path> --at <ref>                replace a path inside a mount with its version in a ref
 
@@ -113,8 +114,11 @@ read-only.
 
 **Durability.** A `write` is visible to every process on the machine at once. `fsync` makes it
 survive a crash of the machine, and uncommitted work survives the mount process being killed:
-the next `ctm mount` of that branch in that directory picks it up. `ctm commit` returns once the
-commit is in the bucket.
+the next `ctm mount` of that branch in that directory picks it up. Commits are local: a mount
+commits on its own after 5 s without writes (or 60 s of continuous writing), and `ctm commit`
+commits at once; either returns without touching the network. The mount pushes commits to the
+bucket in the background, retrying until it gets through; `ctm sync` waits until everything
+committed is pushed, and `ctm unmount` does too unless given `--no-wait`.
 
 ## How it works
 
@@ -159,8 +163,6 @@ exactly what chunking the whole file would give.
   isn't tested yet.
 - **One process per mount** and a control socket each; commands that don't touch a mount talk to
   the bucket directly.
-- If a commit's ref update fails and the mount can't even tell whether it landed, writes return
-  `EIO` until the next `ctm commit` settles it.
 
 ## Benchmarks
 

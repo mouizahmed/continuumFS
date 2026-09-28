@@ -1,10 +1,13 @@
-//! Commit: re-chunk dirty files, rebuild changed trees bottom-up, then publish with a CAS on
+//! Commit and push (R2). A commit is local: re-chunk dirty files, rebuild changed trees
+//! bottom-up, write the new objects into the mount's outgoing packs, and queue the commit in
+//! `state.db`. A push, run in the background, publishes every queued commit with one CAS on
 //! the branch ref (auto-forking when another machine moved it).
 //!
-//! Before the ref update, the commit ID and target ref are recorded in `pending_commit` /
-//! `pending_ref`. If the process dies after the update landed but before the working state
-//! was cleaned, the next mount sees the ref already pointing at the pending commit and
-//! finishes the job, instead of committing again and forking against its own push.
+//! Before the ref update, the last commit pushed, the target ref, and its queue position are
+//! recorded in `pending_commit` / `pending_ref` / `pending_seq`. If the process dies (or the
+//! request gets no answer) after the update landed, the next push sees the ref already
+//! pointing at that commit and just drops the pushed commits from the queue, instead of
+//! pushing again and forking against its own push.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
@@ -17,16 +20,16 @@ use rusqlite::Transaction;
 use ctm_core::layout::paginate;
 use ctm_core::rechunk::{Changes, ReadAt, Segment, rechunk_partial};
 use ctm_core::{
-    Chunk, ChunkList, ChunkRef, Commit, CommitKind, Content, DirEntry, Encoded, Id, Kind, PageRef,
-    Tree,
+    Chunk, ChunkList, ChunkRef, Commit, CommitKind, Content, DirEntry, Encoded, Id, Kind, LogEntry,
+    PageRef, Tree,
 };
 use ctm_repo::{BranchName, BranchRef, ForkedFrom, Repo, rfc3339};
 use ctm_store::ETag;
 
 use crate::db::{self, WorkDb};
 use crate::inode::ROOT;
-use crate::state::{Base, FileView, MountState, Unresolved, now_ns};
-use crate::{CommitOutcome, Errno, Error, Result};
+use crate::state::{Base, FileView, MountState, now_ns};
+use crate::{CommitOutcome, Errno, Error, PushOutcome, Result};
 
 /// Files committed at once, and chunks each holds before uploading them: at most
 /// 16 × 4 × 4 MiB = 256 MiB in memory.
@@ -34,26 +37,6 @@ const COMMIT_FILES: usize = 16;
 const UPLOAD_BATCH: usize = 4;
 /// Auto-fork names tried: `<branch>.<host>`, then `-2` … up to this.
 const FORK_ATTEMPTS: u32 = 100;
-
-/// A commit built and uploaded, not yet published.
-pub(crate) struct Prepared {
-    commit: Id,
-    root: Id,
-    /// New entries for changed files and symlinks, by inode.
-    files: HashMap<u64, DirEntry>,
-    /// Files whose staging can go once the commit lands.
-    dirty: Vec<u64>,
-    /// New trees for changed directories, by inode.
-    dirs: HashMap<u64, Id>,
-    /// File IDs given to changed entries that had none (from format-1 trees), by inode.
-    new_ids: HashMap<u64, u64>,
-    /// File IDs given to unchanged entries of rewritten format-1 trees: (dir, name, id).
-    base_ids: Vec<(u64, Vec<u8>, u64)>,
-    /// The ref being written, and where.
-    new_ref: BranchRef,
-    target: BranchName,
-    forked_from: Option<BranchName>,
-}
 
 /// What building the trees produces, gathered from concurrent tasks.
 #[derive(Default)]
@@ -80,7 +63,6 @@ struct Snapshot {
     nodes: HashMap<u64, SnapNode>,
     children: HashMap<u64, Vec<(Vec<u8>, u64)>>,
     whiteouts: HashSet<(u64, Vec<u8>)>,
-    base: Base,
 }
 
 fn errno(e: Errno) -> Error {
@@ -157,7 +139,8 @@ pub(crate) fn load_base(db: &WorkDb) -> Result<Option<Base>> {
 
 fn clear_pending(t: &Transaction<'_>) -> Result<()> {
     db::delete_meta(t, "pending_commit")?;
-    db::delete_meta(t, "pending_ref")
+    db::delete_meta(t, "pending_ref")?;
+    db::delete_meta(t, "pending_seq")
 }
 
 /// Whether `commit` is the head of `target`: `Some` with the ref and its ETag if so.
@@ -169,8 +152,9 @@ async fn landed(repo: &Repo, target: &BranchName, commit: Id) -> Result<Option<(
     }
 }
 
-/// Finishes a commit interrupted by a crash: if its ref update landed, the working state is
-/// already in the bucket, so it's dropped and the mount moves to the new commit.
+/// Finishes a commit interrupted by a crash in a v0.2 mount, whose commits pushed as they were
+/// made: if its ref update landed, the working state is already in the bucket, so it's dropped
+/// and the mount moves to the new commit.
 pub(crate) async fn recover_at_open(
     repo: &Repo,
     db: &mut WorkDb,
@@ -180,6 +164,10 @@ pub(crate) async fn recover_at_open(
     let (Some(commit), Some(target)) = (db.meta("pending_commit")?, db.meta("pending_ref")?) else {
         return Ok(base);
     };
+    // A push's marker (R2): the next push resolves it.
+    if db.meta("pending_seq")?.is_some() {
+        return Ok(base);
+    }
     let commit = parse_id(&commit)?;
     let target = BranchName::new(&target)?;
     let Some((r, etag)) = landed(repo, &target, commit).await? else {
@@ -235,133 +223,270 @@ impl ReadAt for MergedReader<'_> {
     }
 }
 
+/// After a local commit: changed entries point at their new content, and nothing is dirty.
+fn apply_built(inner: &mut crate::state::Inner, p: &Built) {
+    for (ino, e) in &p.files {
+        if let Some(n) = inner.inodes.get_mut(*ino) {
+            n.entry.content = e.content.clone();
+            n.entry.size = e.size;
+            n.base_len = e.size;
+            n.base_visible = e.size;
+            n.dirty = false;
+        }
+    }
+    for (ino, tree) in &p.dirs {
+        if let Some(n) = inner.inodes.get_mut(*ino) {
+            n.entry.content = Content::Dir(*tree);
+        }
+    }
+    // Entries that just got file IDs keep the inode numbers the kernel knows them by until
+    // they're next looked up fresh; the IDs are what later mounts will use.
+    for (ino, id) in &p.new_ids {
+        if let Some(n) = inner.inodes.get_mut(*ino) {
+            n.entry.file_id = Some(*id);
+        }
+    }
+    for (dir, name, id) in &p.base_ids {
+        if let Some(ino) = inner.inodes.child(*dir, name)
+            && let Some(n) = inner.inodes.get_mut(ino)
+            && n.entry.file_id.is_none()
+        {
+            n.entry.file_id = Some(*id);
+        }
+    }
+    let mut orphans = HashSet::new();
+    for (ino, n) in inner.inodes.iter_mut() {
+        if n.unlinked {
+            orphans.insert(ino);
+        } else {
+            n.changed = false;
+        }
+    }
+    inner.whiteouts.clear();
+    inner.extents.retain(|ino, _| orphans.contains(ino));
+}
+
 impl MountState {
-    /// Re-chunks dirty files, uploads, and CASes the branch ref; auto-forks on a lost race.
-    /// Writes wait while it runs; reads don't. Needs a multi-threaded tokio runtime.
+    /// Commits the working state locally (R2): re-chunks dirty files, rebuilds the changed trees,
+    /// writes the new objects into this mount's outgoing packs durably, and queues the commit to
+    /// be pushed. No network. Writes wait while it runs; reads don't. Needs a multi-threaded
+    /// tokio runtime.
     pub async fn commit(&self, message: &str) -> Result<CommitOutcome> {
+        self.commit_as(CommitKind::Manual, message).await
+    }
+
+    /// A commit made because the mount went quiet (or stayed dirty too long).
+    pub async fn auto_commit(&self) -> Result<CommitOutcome> {
+        self.commit_as(CommitKind::Auto, "").await
+    }
+
+    async fn commit_as(&self, kind: CommitKind, message: &str) -> Result<CommitOutcome> {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
         let _gate = self.gate.write().await;
-        let unresolved = self.lock().unresolved.take();
-        if let Some(u) = unresolved {
-            match landed(&self.repo, &u.prepared.target, u.prepared.commit).await {
-                Ok(Some((r, etag))) => return self.apply(u.prepared, r, etag),
-                Ok(None) => self.lock().db().tx(clear_pending)?,
-                Err(e) => {
-                    self.lock().unresolved = Some(u);
-                    return Err(e);
-                }
-            }
-        }
         let snap = self.snapshot();
         if !snap.nodes.contains_key(&ROOT) {
+            *self.activity.lock().unwrap() = Default::default();
             return Ok(CommitOutcome::NothingToCommit);
         }
         // Trees are written in the current format; older clients must refuse the repo first.
         self.repo.upgrade_format().await?;
-        let base = snap.base.clone();
+        let built = std::sync::Mutex::new(Built::default());
+        let slots = tokio::sync::Semaphore::new(COMMIT_FILES);
+        let root = self.build_tree(&snap, ROOT, &built, &slots).await?;
+        let built = built.into_inner().unwrap();
+        let identity = self.repo.identity();
+        let commit = Commit {
+            root_tree: root,
+            time_ns: now_ns(),
+            author: identity.author(),
+            machine_id: identity.machine_id,
+            kind,
+            message: message.to_string(),
+        };
+        let enc = Encoded::new(self.repo.key(), &commit);
+        let id = enc.id;
+        self.repo.put_objects(vec![enc]).await?;
+        // The objects are on disk before the commit that needs them is queued.
+        self.repo.seal().await?;
+        {
+            let mut inner = self.lock();
+            let base = Base {
+                commit: id,
+                root,
+                ..inner.base.clone()
+            };
+            inner.db().tx(|t| {
+                db::add_pending(t, &id, kind, message, commit.time_ns)?;
+                db::clear_working_state(t)?;
+                save_base(t, &base)
+            })?;
+            inner.db().sync()?;
+            apply_built(&mut inner, &built);
+            inner.base = base;
+        }
+        // Writes wait on the gate, so none happened since the snapshot.
+        *self.activity.lock().unwrap() = Default::default();
+        for ino in &built.dirty {
+            self.drop_staging(*ino);
+        }
+        self.pushable.notify_one();
+        Ok(CommitOutcome::Committed { commit: id })
+    }
+
+    /// Wakes when a local commit is waiting to be pushed.
+    pub async fn wait_for_commits(&self) {
+        self.pushable.notified().await
+    }
+
+    /// Commits made locally and not yet pushed: how many, and when the oldest was made.
+    pub fn unpushed(&self) -> Result<(usize, Option<i64>)> {
+        if self.read_only {
+            return Ok((0, None));
+        }
+        let pending = self.lock().db().pending()?;
+        Ok((pending.len(), pending.first().map(|p| p.time_ns)))
+    }
+
+    /// One attempt to push every queued commit: uploads the outgoing packs and an index
+    /// segment, appends the commits to the branch's log, and CASes the ref, auto-forking if
+    /// another machine moved it. After an error, the next attempt first finds out whether this
+    /// one's ref update landed.
+    pub async fn push(&self) -> Result<PushOutcome> {
+        if self.read_only {
+            return Ok(PushOutcome::NothingToPush);
+        }
+        let _one = self.pushing.lock().await;
+        // A ref update with no answer: find out whether it landed before trying again.
+        let marker = {
+            let mut inner = self.lock();
+            let db = inner.db();
+            match (
+                db.meta("pending_commit")?,
+                db.meta("pending_ref")?,
+                db.meta("pending_seq")?,
+            ) {
+                (Some(c), Some(r), Some(seq)) => Some((
+                    parse_id(&c)?,
+                    BranchName::new(&r)?,
+                    seq.parse::<i64>().map_err(|_| {
+                        Error::Io(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("bad pending_seq {seq:?} in state.db"),
+                        ))
+                    })?,
+                )),
+                _ => None,
+            }
+        };
+        if let Some((commit, target, seq)) = marker {
+            match landed(&self.repo, &target, commit).await? {
+                Some((r, etag)) => {
+                    // An auto-fork's ref landed if the target isn't the mount's branch.
+                    let branch = self.lock().base.branch.clone();
+                    let from = branch.filter(|b| *b != target);
+                    return self.pushed(seq, commit, target, r, etag, from);
+                }
+                None => self.lock().db().tx(clear_pending)?,
+            }
+        }
+        let pending = self.lock().db().pending()?;
+        let Some(last) = pending.last() else {
+            return Ok(PushOutcome::NothingToPush);
+        };
+        let base = self.lock().base.clone();
         let branch = base
             .branch
             .clone()
             .expect("read-write mounts have a branch");
-        let mut prepared = Prepared {
-            commit: Id([0; 32]),
-            root: Id([0; 32]),
-            files: HashMap::new(),
-            dirty: Vec::new(),
-            dirs: HashMap::new(),
-            new_ids: HashMap::new(),
-            base_ids: Vec::new(),
-            new_ref: base
-                .branch_ref
-                .clone()
-                .expect("read-write mounts have a ref"),
-            target: branch.clone(),
-            forked_from: None,
-        };
-        let built = std::sync::Mutex::new(Built::default());
-        let slots = tokio::sync::Semaphore::new(COMMIT_FILES);
-        prepared.root = self.build_tree(&snap, ROOT, &built, &slots).await?;
-        let built = built.into_inner().unwrap();
-        prepared.files = built.files;
-        prepared.dirty = built.dirty;
-        prepared.dirs = built.dirs;
-        prepared.new_ids = built.new_ids;
-        prepared.base_ids = built.base_ids;
-        let identity = self.repo.identity();
-        let commit = Commit {
-            root_tree: prepared.root,
-            time_ns: now_ns(),
-            author: identity.author(),
-            machine_id: identity.machine_id,
-            kind: CommitKind::Manual,
-            message: message.to_string(),
-        };
-        let enc = Encoded::new(self.repo.key(), &commit);
-        prepared.commit = enc.id;
-        self.repo.put_objects(vec![enc]).await?;
-        prepared.new_ref = self
-            .repo
-            .append_log(
-                &prepared.new_ref,
-                prepared.commit,
-                CommitKind::Manual,
-                message,
-            )
-            .await?;
-
-        self.set_pending(prepared.commit, &branch)?;
+        let current = base
+            .branch_ref
+            .clone()
+            .expect("read-write mounts have a ref");
+        let entries = pending
+            .iter()
+            .map(|p| LogEntry {
+                time_ns: p.time_ns,
+                commit: p.commit,
+                kind: p.kind,
+                message: p.message.clone(),
+            })
+            .collect();
+        let new_ref = self.repo.append_log(&current, entries).await?;
+        self.set_pending(last.commit, &branch, last.seq)?;
         let etag = base.etag.clone().expect("read-write mounts have an ETag");
-        match self.repo.cas_ref(&branch, &prepared.new_ref, &etag).await {
-            Ok(etag) => {
-                let r = prepared.new_ref.clone();
-                self.apply(prepared, r, etag)
-            }
+        match self.repo.cas_ref(&branch, &new_ref, &etag).await {
+            Ok(etag) => self.pushed(last.seq, last.commit, branch, new_ref, etag, None),
             Err(ctm_repo::Error::Store(ctm_store::Error::PreconditionFailed(_))) => {
-                self.auto_fork(prepared, &base).await
+                self.auto_fork(last, new_ref, &base).await
             }
-            Err(e) => self.unknown_outcome(prepared, e.into()).await,
+            Err(e) => {
+                // Did it land anyway? If that can't be told either, the next attempt asks again.
+                if let Ok(Some((r, etag))) = landed(&self.repo, &branch, last.commit).await {
+                    return self.pushed(last.seq, last.commit, branch, r, etag, None);
+                }
+                Err(e.into())
+            }
         }
     }
 
-    fn set_pending(&self, commit: Id, target: &BranchName) -> Result<()> {
+    fn set_pending(&self, commit: Id, target: &BranchName, seq: i64) -> Result<()> {
         let mut inner = self.lock();
         inner.db().tx(|t| {
             db::set_meta(t, "pending_commit", &commit.to_hex())?;
-            db::set_meta(t, "pending_ref", target.as_str())
+            db::set_meta(t, "pending_ref", target.as_str())?;
+            db::set_meta(t, "pending_seq", &seq.to_string())
         })?;
         inner.db().sync()
     }
 
-    /// The branch moved: publish the commit as `<branch>.<host>` instead.
-    async fn auto_fork(&self, mut prepared: Prepared, base: &Base) -> Result<CommitOutcome> {
-        let branch = prepared.target.clone();
+    /// The branch moved on another machine: publish the queued commits as `<branch>.<host>`
+    /// instead, and follow that branch from now on.
+    async fn auto_fork(
+        &self,
+        last: &db::PendingCommit,
+        pushed: BranchRef,
+        base: &Base,
+    ) -> Result<PushOutcome> {
+        let branch = base
+            .branch
+            .clone()
+            .expect("read-write mounts have a branch");
+        let from_commit = base
+            .branch_ref
+            .as_ref()
+            .expect("read-write mounts have a ref")
+            .head;
         let host = self.repo.identity().hostname.clone();
         for attempt in 1..=FORK_ATTEMPTS {
             let name = branch.auto_fork(&host, attempt)?;
-            self.set_pending(prepared.commit, &name)?;
+            self.set_pending(last.commit, &name, last.seq)?;
             let now = rfc3339(now_ns());
             let fork = BranchRef {
-                head: prepared.commit,
-                log: prepared.new_ref.log,
+                head: last.commit,
+                log: pushed.log,
                 head_hint: None,
                 log_hint: None,
                 forked_from: Some(ForkedFrom {
                     from: branch.to_string(),
-                    commit: base.commit,
+                    commit: from_commit,
                     at: now.clone(),
                 }),
                 updated_at: now,
                 updated_by: self.repo.identity().updated_by(),
             };
-            prepared.target = name.clone();
-            prepared.forked_from = Some(branch.clone());
-            prepared.new_ref = fork.clone();
             match self.repo.create_ref(&name, &fork).await {
-                Ok(etag) => return self.apply(prepared, fork, etag),
+                Ok(etag) => {
+                    return self.pushed(last.seq, last.commit, name, fork, etag, Some(branch));
+                }
                 Err(ctm_repo::Error::AlreadyExists(_)) => continue,
-                Err(e) => return self.unknown_outcome(prepared, e.into()).await,
+                Err(e) => {
+                    if let Ok(Some((r, etag))) = landed(&self.repo, &name, last.commit).await {
+                        return self.pushed(last.seq, last.commit, name, r, etag, Some(branch));
+                    }
+                    return Err(e.into());
+                }
             }
         }
         Err(Error::Io(io::Error::other(format!(
@@ -369,96 +494,57 @@ impl MountState {
         ))))
     }
 
-    /// The ref update failed without an answer: look at the ref to find out whether it
-    /// landed. If that can't be told either, writes stop until the next `commit` resolves it.
-    async fn unknown_outcome(&self, prepared: Prepared, error: Error) -> Result<CommitOutcome> {
-        for _ in 0..3 {
-            match landed(&self.repo, &prepared.target, prepared.commit).await {
-                Ok(Some((r, etag))) => return self.apply(prepared, r, etag),
-                Ok(None) => {
-                    self.lock().db().tx(clear_pending)?;
-                    return Err(error);
-                }
-                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(200)).await,
-            }
-        }
-        self.lock().unresolved = Some(Unresolved { prepared });
-        Err(error)
-    }
-
-    /// The commit landed: the working state becomes the new base.
-    fn apply(&self, p: Prepared, r: BranchRef, etag: ETag) -> Result<CommitOutcome> {
-        let outcome = match &p.forked_from {
-            Some(from) => CommitOutcome::AutoForked {
+    /// The queued commits up to `seq` are on `target`: they leave the queue, and the mount's
+    /// pushed ref becomes `r`.
+    fn pushed(
+        &self,
+        seq: i64,
+        commit: Id,
+        target: BranchName,
+        r: BranchRef,
+        etag: ETag,
+        forked_from: Option<BranchName>,
+    ) -> Result<PushOutcome> {
+        let outcome = match &forked_from {
+            Some(from) => PushOutcome::AutoForked {
                 from: from.clone(),
-                branch: p.target.clone(),
-                commit: p.commit,
+                branch: target.clone(),
+                commit,
             },
-            None => CommitOutcome::Pushed { commit: p.commit },
+            None => PushOutcome::Pushed { commit },
         };
         {
             let mut inner = self.lock();
-            for (ino, e) in &p.files {
-                if let Some(n) = inner.inodes.get_mut(*ino) {
-                    n.entry.content = e.content.clone();
-                    n.entry.size = e.size;
-                    n.base_len = e.size;
-                    n.base_visible = e.size;
-                    n.dirty = false;
-                }
-            }
-            for (ino, tree) in &p.dirs {
-                if let Some(n) = inner.inodes.get_mut(*ino) {
-                    n.entry.content = Content::Dir(*tree);
-                }
-            }
-            // Entries that just got file IDs keep the inode numbers the kernel knows them by
-            // until they're next looked up fresh; the IDs are what later mounts will use.
-            for (ino, id) in &p.new_ids {
-                if let Some(n) = inner.inodes.get_mut(*ino) {
-                    n.entry.file_id = Some(*id);
-                }
-            }
-            for (dir, name, id) in &p.base_ids {
-                if let Some(ino) = inner.inodes.child(*dir, name)
-                    && let Some(n) = inner.inodes.get_mut(ino)
-                    && n.entry.file_id.is_none()
-                {
-                    n.entry.file_id = Some(*id);
-                }
-            }
-            let mut orphans = HashSet::new();
-            for (ino, n) in inner.inodes.iter_mut() {
-                if n.unlinked {
-                    orphans.insert(ino);
-                } else {
-                    n.changed = false;
-                }
-            }
-            inner.whiteouts.clear();
-            inner.extents.retain(|ino, _| orphans.contains(ino));
             let base = Base {
-                branch: Some(p.target.clone()),
-                commit: p.commit,
-                root: p.root,
+                branch: Some(target),
                 branch_ref: Some(r),
                 etag: Some(etag),
-                auto_forked_from: p
-                    .forked_from
-                    .clone()
-                    .or_else(|| inner.base.auto_forked_from.clone()),
+                auto_forked_from: forked_from.or_else(|| inner.base.auto_forked_from.clone()),
+                ..inner.base.clone()
             };
             inner.db().tx(|t| {
-                db::clear_working_state(t)?;
+                db::drop_pending(t, seq)?;
                 save_base(t, &base)?;
                 clear_pending(t)
             })?;
             inner.base = base;
         }
-        for ino in &p.dirty {
-            self.drop_staging(*ino);
-        }
+        self.pushed_notify.notify_waiters();
         Ok(outcome)
+    }
+
+    /// Waits until every commit made so far is pushed (the mount process pushes in the
+    /// background).
+    pub async fn wait_pushed(&self) -> Result<()> {
+        loop {
+            let pushed = self.pushed_notify.notified();
+            tokio::pin!(pushed);
+            pushed.as_mut().enable();
+            if self.unpushed()?.0 == 0 {
+                return Ok(());
+            }
+            pushed.await;
+        }
     }
 
     /// The changed part of the tree, copied so the commit can work without the lock.
@@ -491,7 +577,6 @@ impl MountState {
             nodes,
             children,
             whiteouts: inner.whiteouts.clone(),
-            base: inner.base.clone(),
         }
     }
 
@@ -528,13 +613,10 @@ impl MountState {
             }
             entries.insert(e.name.clone(), e);
         }
-        let children = snap
-            .children
-            .get(&dir)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
+        let children = snap.children.get(&dir).cloned().unwrap_or_default();
         let changed: Vec<(Vec<u8>, DirEntry)> = futures::stream::iter(children)
             .map(|(name, child)| async move {
+                let child = &child;
                 let c = &snap.nodes[child];
                 let mut entry = match c.entry.content.kind() {
                     Kind::Dir => {
@@ -561,7 +643,7 @@ impl MountState {
                 if entry.content.kind() != Kind::Dir {
                     built.lock().unwrap().files.insert(*child, entry.clone());
                 }
-                Ok::<_, Error>((name.clone(), entry))
+                Ok::<_, Error>((name, entry))
             })
             .buffer_unordered(COMMIT_FILES)
             .try_collect()

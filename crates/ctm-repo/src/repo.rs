@@ -334,6 +334,24 @@ impl Repo {
         self.objects.uploaded()
     }
 
+    /// Outgoing mode, for mounts: packs are sealed into local files in `dir` (durably) instead
+    /// of uploaded as they fill, and pushed by the next ref write. Packs a previous process left
+    /// there are taken over. Call after `with_index_at`.
+    pub fn with_outgoing(mut self, dir: &Path) -> Result<Repo> {
+        self.objects.set_outgoing(dir)?;
+        Ok(self)
+    }
+
+    /// Outgoing mode: writes everything added so far to local packs, durably.
+    pub async fn seal(&self) -> Result<()> {
+        self.objects.seal().await
+    }
+
+    /// Outgoing mode: whether anything written is not yet pushed.
+    pub fn has_unpushed(&self) -> bool {
+        self.objects.has_unpushed()
+    }
+
     /// Keeps the index mirror in `path` (a SQLite file) instead of in memory, so later
     /// processes start with it. Call right after opening.
     pub fn with_index_at(mut self, path: &Path) -> Result<Repo> {
@@ -381,18 +399,23 @@ impl Repo {
         let direct = match self.objects.locate(id)? {
             Some(loc) => {
                 let payload = u64::from(loc.offset) + ENTRY_HEADER as u64;
-                if payload + end <= loc.range().end {
-                    let key = loc.key(true);
-                    Some((key, payload + start..payload + end, true))
-                } else {
-                    None
-                }
+                (payload + end <= loc.range().end)
+                    .then_some((Some(loc), payload + start..payload + end))
             }
             // Loose (written before R1): `[type][flags]` then the chunk.
-            None => Some((object_key(ObjectType::Chunk, id), 2 + start..2 + end, false)),
+            None => Some((None, 2 + start..2 + end)),
         };
-        if let Some((key, bytes, hinted)) = direct {
-            match self.objects.get_range(&key, bytes).await {
+        if let Some((loc, bytes)) = direct {
+            let hinted = loc.is_some();
+            let got = match loc {
+                Some(loc) => self.objects.pack_range(&loc, true, bytes).await,
+                None => {
+                    self.objects
+                        .get_range(&object_key(ObjectType::Chunk, id), bytes)
+                        .await
+                }
+            };
+            match got {
                 Ok(b) if b.len() == range.len() => return Ok(b),
                 Ok(_) | Err(Error::Store(ctm_store::Error::NotFound(_))) => {
                     if hinted {
@@ -467,7 +490,7 @@ impl Repo {
                 if let Some(span) = st.span {
                     st.body = self
                         .objects
-                        .get_range_stream(&span.key(true), span.range())
+                        .pack_stream(&span, true, span.range())
                         .await
                         .ok();
                 }
@@ -619,37 +642,34 @@ impl Repo {
 
     // History
 
-    /// Appends a commit to a branch's log and returns the ref to CAS. Uploads the new segment.
+    /// Appends entries (oldest first) to a branch's log and returns the ref to CAS, with its head
+    /// at the last entry's commit. Adds the new log segments to the packs.
     pub async fn append_log(
         &self,
         current: &BranchRef,
-        commit: Id,
-        kind: CommitKind,
-        message: &str,
+        entries: Vec<LogEntry>,
     ) -> Result<BranchRef> {
-        let head = self.get::<LogSegment>(&current.log).await?;
-        let entry = LogEntry {
-            time_ns: now_ns(),
-            commit,
-            kind,
-            message: message.to_string(),
-        };
-        let segment = if head.entries.len() < LogSegment::MAX_ENTRIES {
-            let mut entries = head.entries;
-            entries.push(entry);
-            LogSegment {
-                prev: head.prev,
-                entries,
+        let head_commit = entries.last().expect("at least one entry").commit;
+        let mut segment = self.get::<LogSegment>(&current.log).await?;
+        let mut prev_id = current.log;
+        let mut fresh = false;
+        for entry in entries {
+            if segment.entries.len() >= LogSegment::MAX_ENTRIES {
+                // Full: it's stored (it was either read or put below), and a new one starts.
+                if fresh {
+                    prev_id = self.put(&segment).await?;
+                }
+                segment = LogSegment {
+                    prev: Some(prev_id),
+                    entries: Vec::new(),
+                };
             }
-        } else {
-            LogSegment {
-                prev: Some(current.log),
-                entries: vec![entry],
-            }
-        };
+            segment.entries.push(entry);
+            fresh = true;
+        }
         let log = self.put(&segment).await?;
         Ok(BranchRef {
-            head: commit,
+            head: head_commit,
             log,
             head_hint: None,
             log_hint: None,
@@ -874,7 +894,15 @@ impl Repo {
         match self.read_ref(branch).await {
             Ok((current, etag)) => {
                 let next = self
-                    .append_log(&current, id, CommitKind::Import, message)
+                    .append_log(
+                        &current,
+                        vec![LogEntry {
+                            time_ns: now_ns(),
+                            commit: id,
+                            kind: CommitKind::Import,
+                            message: message.to_string(),
+                        }],
+                    )
                     .await?;
                 self.cas_ref(branch, &next, &etag).await?;
             }

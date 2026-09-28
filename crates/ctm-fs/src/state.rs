@@ -110,16 +110,27 @@ pub struct Fh(pub u64);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommitOutcome {
+    /// Committed locally, and queued to be pushed.
+    Committed {
+        commit: Id,
+    },
+    NothingToCommit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PushOutcome {
+    /// The queued commits, up to `commit`, are on the branch.
     Pushed {
         commit: Id,
     },
-    /// The branch moved on another machine; the commit went to `branch`, and the mount follows it.
+    /// The branch moved on another machine; the commits went to `branch`, and the mount
+    /// follows it.
     AutoForked {
         from: BranchName,
         branch: BranchName,
         commit: Id,
     },
-    NothingToCommit,
+    NothingToPush,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,6 +140,9 @@ pub struct Status {
     pub base_commit: Id,
     /// Files and symlinks with uncommitted changes, plus deleted entries.
     pub dirty_files: u64,
+    /// Commits made here and not yet pushed, and when the oldest of them was made.
+    pub unpushed: u64,
+    pub oldest_unpushed_ns: Option<i64>,
     /// The remote ref's ETag differs from this mount's base.
     pub behind: bool,
     /// Set after an auto-fork: the branch the mount was on before.
@@ -201,9 +215,11 @@ pub(crate) struct Base {
     pub auto_forked_from: Option<BranchName>,
 }
 
-/// A commit that was built but whose ref update has an unknown outcome.
-pub(crate) struct Unresolved {
-    pub prepared: crate::commit::Prepared,
+/// When the working state last changed, and since when it has had uncommitted changes.
+#[derive(Default)]
+pub(crate) struct Activity {
+    pub last_write: Option<std::time::Instant>,
+    pub dirty_since: Option<std::time::Instant>,
 }
 
 /// Everything that changes, behind one lock.
@@ -214,7 +230,6 @@ pub(crate) struct Inner {
     /// `None` for read-only mounts, which keep no working state.
     pub db: Option<WorkDb>,
     pub base: Base,
-    pub unresolved: Option<Unresolved>,
 }
 
 impl Inner {
@@ -277,6 +292,14 @@ pub struct MountState {
     pub(crate) inner: Mutex<Inner>,
     /// Write operations hold it shared; commit holds it exclusively. Reads never take it.
     pub(crate) gate: tokio::sync::RwLock<()>,
+    /// One push at a time.
+    pub(crate) pushing: tokio::sync::Mutex<()>,
+    /// Signalled by each local commit, for the pusher.
+    pub(crate) pushable: tokio::sync::Notify,
+    /// Signalled after each successful push, for `wait_pushed`.
+    pub(crate) pushed_notify: tokio::sync::Notify,
+    /// When writes happened since the last commit, for auto-commits.
+    pub(crate) activity: Mutex<Activity>,
     handles: Mutex<HashMap<u64, Handle>>,
     next_fh: AtomicU64,
     layouts: Mutex<HashMap<Id, Arc<Layout>>>,
@@ -480,9 +503,12 @@ impl MountState {
                 extents,
                 db,
                 base,
-                unresolved: None,
             }),
             gate: tokio::sync::RwLock::new(()),
+            pushing: tokio::sync::Mutex::new(()),
+            pushable: tokio::sync::Notify::new(),
+            pushed_notify: tokio::sync::Notify::new(),
+            activity: Mutex::new(Activity::default()),
             handles: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
             layouts: Mutex::new(HashMap::new()),
@@ -538,16 +564,27 @@ impl MountState {
         self.lock().inodes.get(ino).is_some_and(|n| !n.dirty)
     }
 
-    /// Fails unless this mount can take writes right now.
+    /// Fails unless this mount can take writes right now; otherwise records the write, for
+    /// auto-commits.
     fn writable(&self) -> FsResult<()> {
         if self.read_only {
             return Err(Errno::EROFS);
         }
-        if self.lock().unresolved.is_some() {
-            tracing::error!("a commit's outcome is unknown; run `ctm commit` to resolve it");
-            return Err(Errno::EIO);
-        }
+        let now = std::time::Instant::now();
+        let mut a = self.activity.lock().unwrap();
+        a.last_write = Some(now);
+        a.dirty_since.get_or_insert(now);
         Ok(())
+    }
+
+    /// Whether an auto-commit is due: the mount has been quiet for `quiet` since its last write,
+    /// or has had uncommitted changes for `max_dirty`.
+    pub fn commit_due(&self, quiet: std::time::Duration, max_dirty: std::time::Duration) -> bool {
+        let a = self.activity.lock().unwrap();
+        match (a.last_write, a.dirty_since) {
+            (Some(last), Some(since)) => last.elapsed() >= quiet || since.elapsed() >= max_dirty,
+            _ => false,
+        }
     }
 
     // Trees and directory listings
@@ -1508,6 +1545,7 @@ impl MountState {
                 .count();
             (inner.base.clone(), (changed + inner.whiteouts.len()) as u64)
         };
+        let (unpushed, oldest_unpushed_ns) = self.unpushed()?;
         let behind = match (&base.branch, &base.etag) {
             (Some(b), Some(etag)) => {
                 self.repo.backend().head(&b.branch_key()).await?.as_ref() != Some(etag)
@@ -1518,6 +1556,8 @@ impl MountState {
             branch: base.branch,
             base_commit: base.commit,
             dirty_files: dirty,
+            unpushed: unpushed as u64,
+            oldest_unpushed_ns,
             behind,
             auto_forked_from: base.auto_forked_from,
             read_only: self.read_only,

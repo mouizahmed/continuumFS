@@ -133,6 +133,7 @@ pub async fn cat(spec: &str) -> Result<()> {
 }
 
 pub async fn fork(from: &str, new: &str) -> Result<()> {
+    crate::mount::sync_branch(from).await?;
     let repo = open_repo().await?;
     let new = BranchName::new(new)?;
     let r = repo.fork(&from.parse()?, &new).await?;
@@ -150,7 +151,9 @@ pub async fn branch_list() -> Result<()> {
 pub async fn snapshot_create(name: &str, from: Option<&str>) -> Result<()> {
     let repo = open_repo().await?;
     let name = BranchName::new(name)?;
-    let from: RefSpec = from.unwrap_or("main").parse()?;
+    let from_str = from.unwrap_or("main");
+    crate::mount::sync_branch(from_str).await?;
+    let from: RefSpec = from_str.parse()?;
     let snap = repo.snapshot(&name, &from).await?;
     println!("Created snapshot {name} (commit {})", short(&snap.commit));
     Ok(())

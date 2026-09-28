@@ -116,10 +116,16 @@ pub fn identity(host: &str) -> Identity {
     }
 }
 
-/// Opens (or reopens) a mount of `spec` with its working state in `dir/state`.
+/// Opens (or reopens) a mount of `spec` with its working state in `dir/state`. Like the mount
+/// process, it has its own repo handle, keeping outgoing packs in `dir/state/outgoing`.
 pub async fn open(repo: &Arc<Repo>, dir: &Path, spec: &str, read_only: bool) -> MountState {
+    let own = Repo::open(repo.backend().clone(), repo.identity().clone())
+        .await
+        .unwrap()
+        .with_outgoing(&dir.join("state").join("outgoing"))
+        .unwrap();
     MountState::open(
-        repo.clone(),
+        Arc::new(own),
         &dir.join("cache"),
         &dir.join("state"),
         &spec.parse().unwrap(),
@@ -159,4 +165,15 @@ pub async fn read_fh(state: &MountState, fh: Fh, ino: u64) -> Vec<u8> {
         }
         out.extend_from_slice(&chunk);
     }
+}
+
+/// Commits locally and pushes: what `ctm commit` and then `ctm sync` do.
+pub async fn commit_push(state: &MountState, message: &str) -> ctm_fs::PushOutcome {
+    state.commit(message).await.unwrap();
+    state.push().await.unwrap()
+}
+
+/// Pushes until nothing is queued: what `ctm sync` waits for.
+pub async fn sync(state: &MountState) {
+    while state.push().await.unwrap() != ctm_fs::PushOutcome::NothingToPush {}
 }

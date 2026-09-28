@@ -384,7 +384,15 @@ async fn log_spans_segments() {
         };
         // Appending through import is slow for 1000 commits; append a log entry directly.
         let next = repo
-            .append_log(&r, r.head, CommitKind::Manual, &format!("{i}"))
+            .append_log(
+                &r,
+                vec![ctm_core::LogEntry {
+                    time_ns: i as i64,
+                    commit: r.head,
+                    kind: CommitKind::Manual,
+                    message: format!("{i}"),
+                }],
+            )
             .await
             .unwrap();
         repo.cas_ref(&name("main"), &next, &etag).await.unwrap();
@@ -1015,4 +1023,49 @@ async fn part_of_a_chunk_is_one_ranged_get() {
         .unwrap();
     let got = reader.chunk_range(&enc.id, 5..10).await.unwrap();
     assert_eq!(&got[..], &loose.0[5..10]);
+}
+
+#[tokio::test]
+async fn outgoing_packs_stay_local_until_flushed_and_survive_a_restart() {
+    use ctm_core::{Chunk, Encoded};
+    let be = Arc::new(Counting::default());
+    repo_on(be.clone()).await;
+    let out = tempfile::tempdir().unwrap();
+    let local = || async {
+        Repo::open(be.clone(), identity())
+            .await
+            .unwrap()
+            .with_outgoing(out.path())
+            .unwrap()
+    };
+    let repo = local().await;
+    let chunks: Vec<Chunk> = (0..3u64)
+        .map(|i| Chunk(random_bytes(20 + i, 300_000)))
+        .collect();
+    let encoded: Vec<Encoded> = chunks.iter().map(|c| Encoded::new(repo.key(), c)).collect();
+    let ids: Vec<Id> = encoded.iter().map(|e| e.id).collect();
+    be.reset();
+    repo.put_objects(encoded).await.unwrap();
+    repo.seal().await.unwrap();
+    assert_eq!(be.counts()[2], 0, "nothing is uploaded before a flush");
+    assert!(repo.has_unpushed());
+    for (id, c) in ids.iter().zip(&chunks) {
+        assert_eq!(&repo.get::<Chunk>(id).await.unwrap(), c);
+    }
+    // A half-written pack from a crash is dropped; the sealed one is taken over.
+    fs::write(out.path().join("0123.tmp"), b"partial").unwrap();
+    fs::write(out.path().join("4567.pack"), b"not a pack").unwrap();
+    drop(repo);
+    let repo = local().await;
+    assert_eq!(fs::read_dir(out.path()).unwrap().count(), 1);
+    assert_eq!(&repo.get::<Chunk>(&ids[1]).await.unwrap(), &chunks[1]);
+    let got = repo.chunk_range(&ids[2], 10..20).await.unwrap();
+    assert_eq!(&got[..], &chunks[2].0[10..20]);
+    // A flush pushes the pack and its index segment, then the local file goes.
+    repo.flush().await.unwrap();
+    assert_eq!(be.counts()[2], 2);
+    assert!(!repo.has_unpushed());
+    assert_eq!(fs::read_dir(out.path()).unwrap().count(), 0);
+    let elsewhere = Repo::open(be.clone(), identity()).await.unwrap();
+    assert_eq!(&elsewhere.get::<Chunk>(&ids[0]).await.unwrap(), &chunks[0]);
 }
