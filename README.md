@@ -22,18 +22,25 @@ that changed.
 
 It is written in Rust as a single binary (`ctm`), Apache-2.0.
 
-> **Status: v0.** Linux only, for developers comfortable building from source. The storage
-> format is versioned but young: repos written by this version stay readable by later ones, not
-> the other way round. See [Limits](#limits).
+> **Status: v0.2.** Linux only (x86_64 and aarch64). The storage format is versioned: repos
+> written by this version stay readable by later ones, not the other way round. See
+> [Limits](#limits).
 
 ## Quick start
 
-You need Linux, Rust 1.98 or newer, and FUSE 3 (`fusermount3`: the `fuse3` package on most
-distributions).
+You need Linux and FUSE 3 (`fusermount3`: the `fuse3` package on most distributions). Download
+the static binary for your architecture from the
+[latest release](https://github.com/mouizahmed/continuumFS/releases/latest):
 
 ```sh
-cargo install --git https://github.com/mouizahmed/continuumFS ctm
+arch=$(uname -m)   # x86_64 or aarch64
+curl -fsSL https://github.com/mouizahmed/continuumFS/releases/download/v0.2.0/ctm-0.2.0-$arch-unknown-linux-musl.tar.gz \
+  | tar -xz --strip-components=1 -C ~/.local/bin ctm-0.2.0-$arch-unknown-linux-musl/ctm
+ctm --version
 ```
+
+Or build it from source with Rust 1.98 or newer:
+`cargo install --git https://github.com/mouizahmed/continuumFS --tag v0.2.0 ctm`.
 
 Try it without any cloud account, with a repo in a local directory:
 
@@ -138,15 +145,13 @@ exactly what chunking the whole file would give.
 
 ## Limits
 
-- **Linux only**, tested on x86_64. macOS is planned; Windows is not.
+- **Linux only**: binaries for x86_64 and aarch64, tested on x86_64. macOS is planned; Windows is
+  not.
 - **One writer per branch.** Concurrent writers are auto-forked, not merged. `ctm merge` isn't
   there yet.
 - **The bucket only grows.** Nothing is deleted yet: every committed version stays, deleting a
   file frees no space, and objects from interrupted commits are never collected. Garbage
   collection and retention are on the roadmap.
-- **Many small files mean many requests.** Every file over 4 KiB and every changed directory is
-  its own object, so committing a large `node_modules` makes thousands of PUTs. Packfiles are on
-  the roadmap.
 - **Mounts see only their own writes.** Changes committed elsewhere show up in a new mount, not
   an existing one (`ctm status` says when the branch has moved).
 - **Not supported:** hard links (`EPERM`), xattrs, FIFOs, sockets, and device nodes (`ENOTSUP`),
@@ -175,10 +180,10 @@ Published as measured, wins and losses; details and a reading of each number are
 | Cold `find` over the Linux kernel tree (102k entries) | 20 s |
 | Cold `git status` over the Linux kernel tree | 92 min: git re-reads every file on a fresh mount |
 
-Sequential throughput, small-file commits, and `git status` on a fresh mount are v0's weak spots;
-they're what the next versions work on.
+Sequential throughput, small-file commits, and `git status` on a fresh mount were v0's weak spots.
+v0.2 fixes the last two (below); sequential throughput is next on the roadmap.
 
-**Since v0.1** (unreleased, on `main`):
+**In v0.2:**
 
 - Inode numbers are stable file IDs stored in the repo, so a git index written in one mount
   stays valid in the next. `git status` on a fresh mount of git/git (4,852 files) went from
@@ -193,8 +198,8 @@ they're what the next versions work on.
   after 1,000 pushes of history takes under 1 s, down from 4.7–7.5 s spent syncing the index
   first ([details](bench/results/r3-location-hints.md)).
 
-Repos written by v0.1 are still read, and are upgraded to format version 2 on their first write,
-after which v0.1 refuses them.
+Repos written by v0.1 are still read by v0.2, and are upgraded to format version 2 on their first
+write, after which v0.1 refuses them.
 
 ## Development
 
