@@ -31,7 +31,7 @@ use crate::Result;
 /// chunk has at most 64 blocks and its bitmap fits a `u64`.
 pub const BLOCK: u32 = 64 << 10;
 /// `cache.db`'s schema; a cache written by an older version is set aside and deleted.
-const SCHEMA: i64 = 2;
+const SCHEMA: i64 = 3;
 /// Chunks whose state this process remembers without asking `cache.db`.
 const MEMO_MAX: usize = 100_000;
 
@@ -146,11 +146,22 @@ impl ChunkCache {
             if version != SCHEMA {
                 tx.execute_batch(&format!(
                     "DROP TABLE IF EXISTS chunks;
+                     DROP TABLE IF EXISTS totals;
                      CREATE TABLE chunks (
                          id BLOB PRIMARY KEY, generation INTEGER NOT NULL, len INTEGER NOT NULL,
                          blocks INTEGER NOT NULL, verified INTEGER NOT NULL,
                          size INTEGER NOT NULL, last_access INTEGER NOT NULL);
                      CREATE INDEX chunks_lru ON chunks (last_access);
+                     -- The bytes present, kept by triggers: summing the table on every insert
+                     -- made caching a commit's chunks quadratic.
+                     CREATE TABLE totals (bytes INTEGER NOT NULL);
+                     INSERT INTO totals VALUES (0);
+                     CREATE TRIGGER chunks_added AFTER INSERT ON chunks
+                         BEGIN UPDATE totals SET bytes = bytes + NEW.size; END;
+                     CREATE TRIGGER chunks_removed AFTER DELETE ON chunks
+                         BEGIN UPDATE totals SET bytes = bytes - OLD.size; END;
+                     CREATE TRIGGER chunks_resized AFTER UPDATE OF size ON chunks
+                         BEGIN UPDATE totals SET bytes = bytes - OLD.size + NEW.size; END;
                      CREATE TABLE IF NOT EXISTS counters (
                          name TEXT PRIMARY KEY, value INTEGER NOT NULL);
                      PRAGMA user_version = {SCHEMA};"
@@ -320,8 +331,11 @@ impl ChunkCache {
                 )
                 .optional()
                 .map_err(sqlite)?;
+            // A delete then an insert (not `OR REPLACE`), so the triggers see both.
+            tx.execute("DELETE FROM chunks WHERE id = ?1", [&id.0[..]])
+                .map_err(sqlite)?;
             tx.execute(
-                "INSERT OR REPLACE INTO chunks
+                "INSERT INTO chunks
                      (id, generation, len, blocks, verified, size, last_access)
                  VALUES (?1, ?2, ?3, ?4, 1, ?3, ?5)",
                 params![
@@ -497,9 +511,7 @@ impl ChunkCache {
     /// returns them for `unlink` after the transaction commits.
     fn over_limit(&self, tx: &Transaction, keep: &Id) -> Result<Vec<(Id, i64)>> {
         let mut total: i64 = tx
-            .query_row("SELECT COALESCE(SUM(size), 0) FROM chunks", [], |r| {
-                r.get(0)
-            })
+            .query_row("SELECT bytes FROM totals", [], |r| r.get(0))
             .map_err(sqlite)?;
         let mut victims = Vec::new();
         if total <= self.limit as i64 {
@@ -590,7 +602,7 @@ impl ChunkCache {
         let db = self.db.lock().unwrap();
         let (bytes, objects): (i64, i64) = db
             .query_row(
-                "SELECT COALESCE(SUM(size), 0), COUNT(*) FROM chunks",
+                "SELECT (SELECT bytes FROM totals), COUNT(*) FROM chunks",
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )

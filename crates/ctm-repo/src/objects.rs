@@ -90,6 +90,9 @@ struct Open {
     failed: Vec<Sealed>,
     /// Outgoing mode: packs sealed to local files and not yet pushed, by ID, in sealing order.
     local: Vec<(PackId, std::path::PathBuf, Vec<Listed>)>,
+    /// Outgoing mode: local files of packs just pushed, renamed `<pack-id>.pushed`, for the
+    /// owner to copy into its caches and delete (`take_pushed`).
+    pushed: Vec<std::path::PathBuf>,
 }
 
 /// `index.db`: the mirror of the bucket's index segments, and the hints learned from reads.
@@ -349,6 +352,7 @@ impl Objects {
         let mut found = Vec::new();
         for f in std::fs::read_dir(dir)? {
             let path = f?.path();
+            // `.pushed` files are in the bucket already; `.tmp` ones were never sealed.
             if path.extension().is_some_and(|e| e == "pack")
                 && let Ok((pack, entries)) = read_trailer(&std::fs::read(&path)?)
                 && !entries.is_empty()
@@ -682,13 +686,21 @@ impl Objects {
                 known.insert(*id);
             }
         }
+        // Kept for the owner's caches (`take_pushed`), under a name a restart deletes.
+        let mut pushed = Vec::with_capacity(local.len());
         for (_, path, _) in &local {
-            match std::fs::remove_file(path) {
-                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-                _ => {}
-            }
+            let renamed = path.with_extension("pushed");
+            std::fs::rename(path, &renamed)?;
+            pushed.push(renamed);
         }
+        self.open.lock().unwrap().pushed.extend(pushed);
         Ok(())
+    }
+
+    /// Outgoing mode: the local files of packs pushed since the last call, now in the bucket.
+    /// The caller may copy objects out of them into its caches, and then deletes them.
+    pub fn take_pushed(&self) -> Vec<std::path::PathBuf> {
+        std::mem::take(&mut self.open.lock().unwrap().pushed)
     }
 
     /// Fetches index segments the mirror hasn't seen. With `missed_at` (when a lookup missed),

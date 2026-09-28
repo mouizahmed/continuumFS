@@ -1061,10 +1061,16 @@ async fn outgoing_packs_stay_local_until_flushed_and_survive_a_restart() {
     assert_eq!(&repo.get::<Chunk>(&ids[1]).await.unwrap(), &chunks[1]);
     let got = repo.chunk_range(&ids[2], 10..20).await.unwrap();
     assert_eq!(&got[..], &chunks[2].0[10..20]);
-    // A flush pushes the pack and its index segment, then the local file goes.
+    // A flush pushes the pack and its index segment; the local file is handed over for caching
+    // (a restart deletes it).
     repo.flush().await.unwrap();
     assert_eq!(be.counts()[2], 2);
     assert!(!repo.has_unpushed());
+    let pushed = repo.take_pushed();
+    assert_eq!(pushed.len(), 1);
+    assert_eq!(fs::read_dir(out.path()).unwrap().count(), 1);
+    drop(repo);
+    local().await;
     assert_eq!(fs::read_dir(out.path()).unwrap().count(), 0);
     let elsewhere = Repo::open(be.clone(), identity()).await.unwrap();
     assert_eq!(&elsewhere.get::<Chunk>(&ids[0]).await.unwrap(), &chunks[0]);

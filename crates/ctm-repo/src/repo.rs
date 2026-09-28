@@ -347,6 +347,12 @@ impl Repo {
         self.objects.seal().await
     }
 
+    /// Outgoing mode: the local files of packs pushed since the last call. The caller may copy
+    /// objects out of them (`ctm_core::pack::read_trailer`) into its caches, then deletes them.
+    pub fn take_pushed(&self) -> Vec<std::path::PathBuf> {
+        self.objects.take_pushed()
+    }
+
     /// Outgoing mode: whether anything written is not yet pushed.
     pub fn has_unpushed(&self) -> bool {
         self.objects.has_unpushed()

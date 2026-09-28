@@ -784,3 +784,30 @@ async fn format_1_entries_get_file_ids_when_their_directory_is_committed() {
     assert_eq!(lookup_path(&three, "touch.txt").await.unwrap(), touch2);
     assert_eq!(read_all(&three, touch2).await, b"new");
 }
+
+/// R2: once pushed, what a mount wrote is copied from its outgoing packs into the caches, so
+/// reading it back downloads nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn pushed_data_is_read_back_from_the_cache() {
+    let counting = Arc::new(Counting::default());
+    let repo = repo_with(counting.clone(), &[("keep", b"k".to_vec())]).await;
+    let dir = tempfile::tempdir().unwrap();
+    let state = open(&repo, dir.path(), "main", false).await;
+    let data = random_bytes(8, 3 << 20);
+    write_file(&state, "new.bin", &data).await;
+    assert!(matches!(
+        commit_push(&state, "new").await,
+        PushOutcome::Pushed { .. }
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(
+        fs::read_dir(dir.path().join("state/outgoing"))
+            .unwrap()
+            .count(),
+        0
+    );
+    counting.reset();
+    let ino = lookup_path(&state, "new.bin").await.unwrap();
+    assert_eq!(read_all(&state, ino).await, data);
+    assert_eq!(counting.chunk_gets(), 0);
+}

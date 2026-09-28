@@ -19,6 +19,7 @@ use futures::{FutureExt, StreamExt};
 use tokio::sync::Semaphore;
 
 use ctm_core::encoding::decode_verified;
+use ctm_core::pack::{Entry, read_trailer};
 use ctm_core::{Chunk, ChunkRef, Id, Object, ObjectType, Tree};
 use ctm_repo::Repo;
 use ctm_store::cache::{BLOCK, CacheStats, ChunkCache, MetaCache};
@@ -322,11 +323,41 @@ impl Fetcher {
             .map(Arc::from))
     }
 
-    /// Adds a chunk this machine just wrote to the cache.
-    pub fn cache_chunk(&self, id: &Id, bytes: &[u8]) {
-        if let Err(e) = self.chunks.insert(id, bytes) {
-            tracing::warn!("caching chunk {id}: {e}");
+    /// Copies the objects of packs this mount just pushed into the caches (chunks into the
+    /// chunk cache, the rest into the metadata cache), then deletes the pack files. Runs off
+    /// the async threads.
+    pub fn cache_pushed(self: &Arc<Self>, files: Vec<std::path::PathBuf>) {
+        if files.is_empty() {
+            return;
         }
+        let this = self.clone();
+        tokio::task::spawn_blocking(move || {
+            for file in files {
+                if let Err(e) = this.cache_pack(&file) {
+                    tracing::warn!("caching pushed pack {}: {e}", file.display());
+                }
+                let _ = std::fs::remove_file(&file);
+            }
+        });
+    }
+
+    fn cache_pack(&self, file: &Path) -> Result<(), FetchError> {
+        let pack = std::fs::read(file).map_err(FetchError::new)?;
+        let (_, entries) = read_trailer(&pack).map_err(FetchError::new)?;
+        for (id, ty, loc) in entries {
+            let bytes = &pack[loc.range().start as usize..loc.range().end as usize];
+            let entry = Entry::parse(bytes).map_err(FetchError::new)?;
+            if ty.is_data() {
+                self.chunks
+                    .insert(&id, entry.payload)
+                    .map_err(FetchError::new)?;
+            } else {
+                self.meta
+                    .insert(&id, &entry.to_stored())
+                    .map_err(FetchError::new)?;
+            }
+        }
+        Ok(())
     }
 
     /// Starts downloading whole chunks in the background, as one batch: those stored next to

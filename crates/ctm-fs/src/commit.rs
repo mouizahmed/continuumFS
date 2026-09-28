@@ -529,6 +529,8 @@ impl MountState {
             })?;
             inner.base = base;
         }
+        // Reads of what was just pushed would otherwise go to the bucket.
+        self.fetcher.cache_pushed(self.repo.take_pushed());
         self.pushed_notify.notify_waiters();
         Ok(outcome)
     }
@@ -722,7 +724,6 @@ impl MountState {
                             .map_err(errno)?;
                         let chunk = Chunk(bytes);
                         let enc = Encoded::new(self.repo.key(), &chunk);
-                        self.fetcher.cache_chunk(&enc.id, &chunk.0);
                         chunks.push(ChunkRef { id: enc.id, len });
                         batch.push(enc);
                         if batch.len() >= UPLOAD_BATCH {
