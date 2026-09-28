@@ -348,3 +348,78 @@ pub fn decode_index(bytes: &[u8]) -> Result<Vec<Listed>, DecodeError> {
     }
     Ok(out)
 }
+
+const DEAD_MAGIC: &[u8; 8] = b"CTMDEAD1";
+
+/// What a GC run found unreachable (`index/dead/<run-id>`, R6): objects no ref reaches, and
+/// packs no index segment lists. A later run, at least a grace period later, deletes whatever
+/// is still unreachable; meanwhile clients stop deduplicating against these objects.
+///
+/// ```text
+/// "CTMDEAD1" count u32, count × id, orphans u32, orphans × { pack_id, data u8 }, blake3
+/// ```
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DeadList {
+    pub objects: Vec<Id>,
+    /// Packs (and whether each is a data pack) that no index segment listed.
+    pub orphans: Vec<(PackId, bool)>,
+}
+
+impl DeadList {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf =
+            Vec::with_capacity(16 + self.objects.len() * 32 + self.orphans.len() * 17 + 32);
+        buf.extend_from_slice(DEAD_MAGIC);
+        buf.extend_from_slice(&(self.objects.len() as u32).to_le_bytes());
+        for id in &self.objects {
+            buf.extend_from_slice(&id.0);
+        }
+        buf.extend_from_slice(&(self.orphans.len() as u32).to_le_bytes());
+        for (pack, data) in &self.orphans {
+            buf.extend_from_slice(&pack.0);
+            buf.push(u8::from(*data));
+        }
+        let hash = blake3::hash(&buf);
+        buf.extend_from_slice(hash.as_bytes());
+        buf
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<DeadList, DecodeError> {
+        let bad = || DecodeError::Invalid("dead list");
+        if bytes.len() < 8 + 4 + 4 + 32 || &bytes[..8] != DEAD_MAGIC {
+            return Err(bad());
+        }
+        let body = &bytes[..bytes.len() - 32];
+        if blake3::hash(body).as_bytes()[..] != bytes[body.len()..] {
+            return Err(DecodeError::Invalid("dead list checksum"));
+        }
+        let count = u32_at(body, 8) as usize;
+        let ids_end = 12usize
+            .checked_add(count.checked_mul(32).ok_or_else(bad)?)
+            .ok_or_else(bad)?;
+        if body.len() < ids_end + 4 {
+            return Err(bad());
+        }
+        let objects = body[12..ids_end]
+            .as_chunks::<32>()
+            .0
+            .iter()
+            .map(|c| Id(*c))
+            .collect();
+        let orphans_n = u32_at(body, ids_end) as usize;
+        let rest = &body[ids_end + 4..];
+        if rest.len() != orphans_n.checked_mul(17).ok_or_else(bad)? {
+            return Err(bad());
+        }
+        let mut orphans = Vec::with_capacity(orphans_n);
+        for o in rest.as_chunks::<17>().0 {
+            let data = match o[16] {
+                0 => false,
+                1 => true,
+                _ => return Err(bad()),
+            };
+            orphans.push((PackId(o[..16].try_into().expect("16 bytes")), data));
+        }
+        Ok(DeadList { objects, orphans })
+    }
+}

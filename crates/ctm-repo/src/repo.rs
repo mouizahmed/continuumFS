@@ -197,7 +197,7 @@ impl Repo {
     fn new(backend: Arc<dyn Backend>, config: RepoConfig, identity: Identity) -> Result<Repo> {
         let key = config.key()?;
         Ok(Repo {
-            objects: Objects::new(backend.clone(), key.clone(), None)?,
+            objects: Objects::new(backend.clone(), key.clone(), config.params(), None)?,
             key,
             params: config.params(),
             format_version: AtomicU32::new(config.format_version),
@@ -361,7 +361,12 @@ impl Repo {
     /// Keeps the index mirror in `path` (a SQLite file) instead of in memory, so later
     /// processes start with it. Call right after opening.
     pub fn with_index_at(mut self, path: &Path) -> Result<Repo> {
-        self.objects = Objects::new(self.backend.clone(), self.key.clone(), Some(path))?;
+        self.objects = Objects::new(
+            self.backend.clone(),
+            self.key.clone(),
+            self.params,
+            Some(path),
+        )?;
         Ok(self)
     }
 

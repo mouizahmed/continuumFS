@@ -3,7 +3,7 @@
 use ctm_core::pack::{
     Entry, HINT_LEN, Location, PackBuilder, PackId, decode_index, encode_index, read_trailer,
 };
-use ctm_core::{Chunk, Commit, CommitKind, Encoded, Id, RepoKey};
+use ctm_core::{Chunk, Commit, CommitKind, Encoded, Id, ObjectType, RepoKey};
 
 fn objects() -> Vec<Encoded> {
     let key = RepoKey([3; 32]);
@@ -151,4 +151,51 @@ fn objects_list_their_references_in_payload_order() {
         }],
     };
     assert_eq!(log.refs(), [Id([7; 32]), Id([8; 32])]);
+}
+
+#[test]
+fn dead_lists_round_trip_and_reject_damage() {
+    use ctm_core::pack::DeadList;
+    let list = DeadList {
+        objects: vec![Id([1; 32]), Id([2; 32])],
+        orphans: vec![(PackId([3; 16]), true), (PackId([4; 16]), false)],
+    };
+    let bytes = list.encode();
+    assert_eq!(DeadList::decode(&bytes).unwrap(), list);
+    assert_eq!(
+        DeadList::decode(&DeadList::default().encode()).unwrap(),
+        DeadList::default()
+    );
+    for at in [0, 9, bytes.len() / 2, bytes.len() - 1] {
+        let mut bad = bytes.clone();
+        bad[at] ^= 0xff;
+        assert!(
+            DeadList::decode(&bad).is_err(),
+            "flipping byte {at} went unnoticed"
+        );
+    }
+}
+
+#[test]
+fn refs_of_matches_each_type() {
+    use ctm_core::encoding::refs_of;
+    use ctm_core::{FormatParams, Object};
+    let params = FormatParams::DEFAULT;
+    let commit = Commit {
+        root_tree: Id([9; 32]),
+        time_ns: 1,
+        author: "a@b".into(),
+        machine_id: [0; 16],
+        kind: CommitKind::Manual,
+        message: String::new(),
+    };
+    assert_eq!(
+        refs_of(ObjectType::Commit, &commit.encode(), &params).unwrap(),
+        [Id([9; 32])]
+    );
+    assert!(
+        refs_of(ObjectType::Chunk, b"data", &params)
+            .unwrap()
+            .is_empty()
+    );
 }

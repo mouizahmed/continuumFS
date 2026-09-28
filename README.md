@@ -105,6 +105,8 @@ ctm restore <path> --at <ref>                replace a path inside a mount with 
 ctm fork <from-ref> <new-branch>             ctm branch list
 ctm snapshot create <name> [--from <ref>]    ctm snapshot list
 ctm log <ref> [-- <path>]                    ctm diff <ref-a> <ref-b> [--stat]
+ctm gc [--dry-run]                           drop old auto-commits, delete unreachable data
+ctm fsck [<ref>]                             verify everything reachable (downloads it)
 ctm cache stats [--json]
 ```
 
@@ -153,9 +155,10 @@ exactly what chunking the whole file would give.
   not.
 - **One writer per branch.** Concurrent writers are auto-forked, not merged. `ctm merge` isn't
   there yet.
-- **The bucket only grows.** Nothing is deleted yet: every committed version stays, deleting a
-  file frees no space, and objects from interrupted commits are never collected. Garbage
-  collection and retention are on the roadmap.
+- **Garbage collection runs by hand.** `ctm gc` drops auto-commits older than 14 days and deletes
+  what's no longer reachable, a day after first finding it unreachable; run it periodically
+  (a daily timer comes with the daemon). Manual commits and snapshots are kept until deleted, and
+  branches can't be deleted yet.
 - **Mounts see only their own writes.** Changes committed elsewhere show up in a new mount, not
   an existing one (`ctm status` says when the branch has moved).
 - **Not supported:** hard links (`EPERM`), xattrs, FIFOs, sockets, and device nodes (`ENOTSUP`),

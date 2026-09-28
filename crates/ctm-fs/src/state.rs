@@ -535,6 +535,18 @@ impl MountState {
         self.lock().base.commit
     }
 
+    /// The commit this mount needs kept in the bucket: its last pushed head (read-write), or
+    /// the commit it shows (read-only). Mount records name it for GC.
+    pub fn pushed_commit(&self) -> Id {
+        let inner = self.lock();
+        inner
+            .base
+            .branch_ref
+            .as_ref()
+            .filter(|_| !self.read_only)
+            .map_or(inner.base.commit, |r| r.head)
+    }
+
     /// The branch this mount writes to (it changes after an auto-fork).
     pub fn branch(&self) -> Option<BranchName> {
         self.lock().base.branch.clone()

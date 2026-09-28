@@ -23,23 +23,25 @@ use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
 use rusqlite::{Connection, OptionalExtension, params};
 
-use ctm_core::encoding::VerifyError;
+use ctm_core::encoding::{VerifyError, refs_of};
 use ctm_core::pack::{
-    Entry, Listed, Location, PACK_TARGET, PackBuilder, PackId, decode_index, encode_index,
-    read_trailer,
+    DeadList, Entry, Listed, Location, PACK_TARGET, PackBuilder, PackId, decode_index,
+    encode_index, read_trailer,
 };
-use ctm_core::{Encoded, Id, ObjectType, RepoKey};
+use ctm_core::{Encoded, FormatParams, Id, ObjectType, RepoKey};
 use ctm_store::{Backend, PutMode};
 
 use crate::{Error, Result};
 
 /// Requests in flight, shared by every operation on a repo.
 const CONCURRENCY: usize = 64;
+/// How stale the dead lists may be when a push checks what it references against them.
+const DEAD_LISTS_FRESH: Duration = Duration::from_secs(3600);
 /// Packs uploading at once (each up to 32 MiB in memory).
 const PACK_UPLOADS: usize = 4;
 /// `index.db`'s schema; a database with another version is a cache from an older build and is
 /// rebuilt.
-const SCHEMA: i64 = 3;
+const SCHEMA: i64 = 4;
 
 /// Where an object is stored before R1: `chunks/<id>` for chunks, `meta/<id>` for the rest.
 pub fn object_key(ty: ObjectType, id: &Id) -> String {
@@ -93,6 +95,10 @@ struct Open {
     /// Outgoing mode: local files of packs just pushed, renamed `<pack-id>.pushed`, for the
     /// owner to copy into its caches and delete (`take_pushed`).
     pushed: Vec<std::path::PathBuf>,
+    /// Objects added since the last index segment, and the objects they reference: those
+    /// referenced but not added are checked against the dead lists before the next ref write.
+    added: HashSet<Id>,
+    refs_out: HashSet<Id>,
 }
 
 /// `index.db`: the mirror of the bucket's index segments, and the hints learned from reads.
@@ -128,6 +134,8 @@ impl IndexDb {
                  DROP TABLE IF EXISTS objects;
                  DROP TABLE IF EXISTS segments;
                  DROP TABLE IF EXISTS hints;
+                 DROP TABLE IF EXISTS dead;
+                 DROP TABLE IF EXISTS dead_lists;
                  CREATE TABLE objects (
                      id BLOB PRIMARY KEY, pack BLOB NOT NULL, offset INTEGER NOT NULL,
                      len INTEGER NOT NULL, type INTEGER NOT NULL);
@@ -135,6 +143,8 @@ impl IndexDb {
                  CREATE TABLE hints (
                      id BLOB PRIMARY KEY, pack BLOB NOT NULL, offset INTEGER NOT NULL,
                      len INTEGER NOT NULL);
+                 CREATE TABLE dead (id BLOB PRIMARY KEY);
+                 CREATE TABLE dead_lists (key TEXT PRIMARY KEY);
                  PRAGMA user_version = {SCHEMA};
                  COMMIT;"
             ))
@@ -214,6 +224,62 @@ impl IndexDb {
         Ok(keys)
     }
 
+    fn seen_dead_lists(&self) -> Result<HashSet<String>> {
+        let db = self.db.lock().unwrap();
+        let mut stmt = db.prepare("SELECT key FROM dead_lists").map_err(sqlite)?;
+        let keys = stmt
+            .query_map([], |r| r.get(0))
+            .map_err(sqlite)?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(sqlite)?;
+        Ok(keys)
+    }
+
+    fn insert_dead(&self, list: &str, ids: &[Id]) -> Result<()> {
+        let mut db = self.db.lock().unwrap();
+        let tx = db.transaction().map_err(sqlite)?;
+        {
+            let mut stmt = tx
+                .prepare_cached("INSERT OR IGNORE INTO dead (id) VALUES (?1)")
+                .map_err(sqlite)?;
+            for id in ids {
+                stmt.execute([&id.0[..]]).map_err(sqlite)?;
+            }
+        }
+        tx.execute("INSERT OR IGNORE INTO dead_lists (key) VALUES (?1)", [list])
+            .map_err(sqlite)?;
+        tx.commit().map_err(sqlite)
+    }
+
+    fn is_dead(&self, id: &Id) -> Result<bool> {
+        let db = self.db.lock().unwrap();
+        db.prepare_cached("SELECT 1 FROM dead WHERE id = ?1")
+            .map_err(sqlite)?
+            .exists([&id.0[..]])
+            .map_err(sqlite)
+    }
+
+    fn has_dead(&self) -> Result<bool> {
+        let db = self.db.lock().unwrap();
+        db.prepare_cached("SELECT 1 FROM dead LIMIT 1")
+            .map_err(sqlite)?
+            .exists([])
+            .map_err(sqlite)
+    }
+
+    /// Forgets every segment (or every dead list): some were deleted, so the rest are re-read.
+    fn reset_segments(&self) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        db.execute_batch("DELETE FROM objects; DELETE FROM segments;")
+            .map_err(sqlite)
+    }
+
+    fn reset_dead(&self) -> Result<()> {
+        let db = self.db.lock().unwrap();
+        db.execute_batch("DELETE FROM dead; DELETE FROM dead_lists;")
+            .map_err(sqlite)
+    }
+
     fn insert(&self, segment: &str, entries: &[Listed]) -> Result<()> {
         let mut db = self.db.lock().unwrap();
         let tx = db.transaction().map_err(sqlite)?;
@@ -282,6 +348,11 @@ fn bad_row() -> Error {
 pub(crate) struct Objects {
     backend: std::sync::Arc<dyn Backend>,
     key: RepoKey,
+    params: FormatParams,
+    /// Whether the mirror knows of any dead objects (skips lookups when it doesn't).
+    has_dead: std::sync::atomic::AtomicBool,
+    /// Dead objects this handle uploaded again: no longer dead as far as it's concerned.
+    revived: Mutex<HashSet<Id>>,
     index: IndexDb,
     open: Mutex<Open>,
     /// Objects this handle has written or read: they exist.
@@ -325,12 +396,17 @@ impl Objects {
     pub fn new(
         backend: std::sync::Arc<dyn Backend>,
         key: RepoKey,
+        params: FormatParams,
         index_db: Option<&Path>,
     ) -> Result<Objects> {
+        let index = IndexDb::open(index_db)?;
         Ok(Objects {
             backend,
             key,
-            index: IndexDb::open(index_db)?,
+            params,
+            has_dead: std::sync::atomic::AtomicBool::new(index.has_dead()?),
+            revived: Mutex::new(HashSet::new()),
+            index,
             open: Mutex::new(Open::default()),
             known: Mutex::new(HashSet::new()),
             flushing: tokio::sync::Mutex::new(()),
@@ -371,10 +447,21 @@ impl Objects {
                 },
             }
         }
+        let params = self.params;
         let open = self.open.get_mut().unwrap();
-        for (_, _, entries) in &found {
+        for (_, path, entries) in &found {
+            let pack = std::fs::read(path)?;
             for (id, ty, loc) in entries {
                 open.located.insert(*id, (*ty, *loc));
+                open.added.insert(*id);
+                if !ty.is_data() {
+                    let bytes = &pack[loc.range().start as usize..loc.range().end as usize];
+                    if let Ok(e) = Entry::parse(bytes)
+                        && let Ok(refs) = refs_of(e.ty, e.payload, &params)
+                    {
+                        open.refs_out.extend(refs);
+                    }
+                }
             }
         }
         open.local = found;
@@ -500,6 +587,98 @@ impl Objects {
         self.index.learned(id)
     }
 
+    /// Whether an object is on a dead list (and this handle hasn't uploaded it again).
+    fn is_dead(&self, id: &Id) -> Result<bool> {
+        if !self.has_dead.load(Ordering::Relaxed) || self.revived.lock().unwrap().contains(id) {
+            return Ok(false);
+        }
+        self.index.is_dead(id)
+    }
+
+    /// Before an index segment (and so before any ref write): objects referenced by what's
+    /// being pushed, but not part of it, must not be ones a GC run marked dead, or the next run
+    /// could delete them under the new ref. Refreshes the dead lists if the last sync is more
+    /// than an hour old, then uploads any such object again (with its dead children).
+    async fn revive_dead(&self) -> Result<()> {
+        let referenced = {
+            let open = self.open.lock().unwrap();
+            open.refs_out.iter().any(|r| !open.added.contains(r))
+        };
+        if !referenced {
+            return Ok(());
+        }
+        let stale = self
+            .synced
+            .lock()
+            .await
+            .is_none_or(|t| t.elapsed() > DEAD_LISTS_FRESH);
+        if stale {
+            self.sync_index(None).await?;
+        }
+        let mut checked: HashSet<Id> = HashSet::new();
+        loop {
+            let todo: Vec<Id> = {
+                let open = self.open.lock().unwrap();
+                open.refs_out
+                    .iter()
+                    .filter(|r| !open.added.contains(r) && !checked.contains(r))
+                    .copied()
+                    .collect()
+            };
+            if todo.is_empty() {
+                return Ok(());
+            }
+            for id in todo {
+                checked.insert(id);
+                if self.is_dead(&id)? {
+                    self.revive(&id).await?;
+                }
+            }
+        }
+    }
+
+    /// Uploads a dead object again, from where it still is (it's deleted only by a later GC
+    /// run, at least a grace period after it was marked).
+    async fn revive(&self, id: &Id) -> Result<()> {
+        let fetched = match self.index.indexed(id)? {
+            Some((ty, _)) => self.read(ty.is_data(), id).await?,
+            None => match self.read(false, id).await {
+                Ok(f) => f,
+                Err(_) => self.read(true, id).await?,
+            },
+        };
+        let corrupt = |source| Error::Corrupt { id: *id, source };
+        let [ty, _, payload @ ..] = &fetched.stored[..] else {
+            return Err(corrupt(VerifyError::Decode(
+                ctm_core::DecodeError::Truncated,
+            )));
+        };
+        let ty = ObjectType::from_u8(*ty).ok_or(corrupt(VerifyError::Decode(
+            ctm_core::DecodeError::UnknownTag {
+                what: "object type",
+                value: *ty,
+            },
+        )))?;
+        let actual = Id::compute(&self.key, ty, payload);
+        if actual != *id {
+            return Err(corrupt(VerifyError::HashMismatch {
+                expected: *id,
+                actual,
+            }));
+        }
+        let refs =
+            refs_of(ty, payload, &self.params).map_err(|e| corrupt(VerifyError::Decode(e)))?;
+        self.put(vec![Encoded {
+            id: *id,
+            ty,
+            payload: payload.to_vec(),
+            refs,
+        }])
+        .await?;
+        self.revived.lock().unwrap().insert(*id);
+        Ok(())
+    }
+
     async fn put_counted(&self, key: &str, body: Vec<u8>) -> Result<()> {
         let len = body.len() as u64;
         let _permit = self.requests.acquire().await.expect("never closed");
@@ -520,12 +699,14 @@ impl Objects {
             let mut open = self.open.lock().unwrap();
             let known = self.known.lock().unwrap();
             for obj in objs {
-                if known.contains(&obj.id)
-                    || open.located.contains_key(&obj.id)
-                    || self.index.indexed(&obj.id)?.is_some()
-                {
+                let stored = open.located.contains_key(&obj.id)
+                    || ((known.contains(&obj.id) || self.index.indexed(&obj.id)?.is_some())
+                        && !self.is_dead(&obj.id)?);
+                if stored {
                     continue;
                 }
+                open.added.insert(obj.id);
+                open.refs_out.extend(obj.refs.iter().copied());
                 let mut hints = Vec::with_capacity(obj.refs.len());
                 for r in &obj.refs {
                     hints.push(match open.located.get(r) {
@@ -605,6 +786,7 @@ impl Objects {
     /// points at an object that isn't in an indexed pack.
     pub async fn flush(&self) -> Result<()> {
         let _guard = self.flushing.lock().await;
+        self.revive_dead().await?;
         if self.outgoing.is_some() {
             return self.push_local().await;
         }
@@ -654,6 +836,10 @@ impl Objects {
             open.located.remove(id);
             known.insert(*id);
         }
+        if open.data.is_none() && open.meta.is_none() && open.unindexed.is_empty() {
+            open.added.clear();
+            open.refs_out.clear();
+        }
         Ok(())
     }
 
@@ -694,6 +880,10 @@ impl Objects {
                 open.located.remove(id);
                 known.insert(*id);
             }
+            if open.local.is_empty() && open.data.is_none() && open.meta.is_none() {
+                open.added.clear();
+                open.refs_out.clear();
+            }
         }
         // Kept for the owner's caches (`take_pushed`), under a name a restart deletes.
         let mut pushed = Vec::with_capacity(local.len());
@@ -722,20 +912,21 @@ impl Objects {
             return Ok(());
         }
         let started = Instant::now();
-        let seen = self.index.seen()?;
-        let new: Vec<String> = self
-            .backend
-            .list("index/")
-            .await?
+        let listed = self.backend.list("index/").await?;
+        let (dead_lists, segments): (Vec<String>, Vec<String>) = listed
             .into_iter()
-            .filter(|k| !seen.contains(k))
-            .collect();
-        let segments: Vec<(String, Vec<Listed>)> = stream::iter(new)
+            .partition(|k| k.starts_with("index/dead/"));
+        // GC compacts the index and deletes dead lists: if anything seen is gone, start over.
+        let mut seen = self.index.seen()?;
+        let listed_segments: HashSet<&String> = segments.iter().collect();
+        if seen.iter().any(|k| !listed_segments.contains(k)) {
+            self.index.reset_segments()?;
+            seen.clear();
+        }
+        let new: Vec<String> = segments.into_iter().filter(|k| !seen.contains(k)).collect();
+        let fetched: Vec<(String, Vec<Listed>)> = stream::iter(new)
             .map(|key| async move {
-                let (bytes, _) = {
-                    let _permit = self.requests.acquire().await.expect("never closed");
-                    self.backend.get(&key).await?
-                };
+                let bytes = self.get_listed(&key).await?;
                 let entries = decode_index(&bytes).map_err(|e| Error::CorruptJson {
                     what: key.clone(),
                     detail: e.to_string(),
@@ -745,11 +936,32 @@ impl Objects {
             .buffer_unordered(16)
             .try_collect()
             .await?;
-        for (key, entries) in segments {
+        for (key, entries) in fetched {
             self.index.insert(&key, &entries)?;
         }
+        let mut seen_dead = self.index.seen_dead_lists()?;
+        let listed_dead: HashSet<&String> = dead_lists.iter().collect();
+        if seen_dead.iter().any(|k| !listed_dead.contains(k)) {
+            self.index.reset_dead()?;
+            seen_dead.clear();
+        }
+        for key in dead_lists.iter().filter(|k| !seen_dead.contains(*k)) {
+            let bytes = self.get_listed(key).await?;
+            let list = DeadList::decode(&bytes).map_err(|e| Error::CorruptJson {
+                what: key.clone(),
+                detail: e.to_string(),
+            })?;
+            self.index.insert_dead(key, &list.objects)?;
+        }
+        self.has_dead
+            .store(self.index.has_dead()?, Ordering::Relaxed);
         *last = Some(started);
         Ok(())
+    }
+
+    async fn get_listed(&self, key: &str) -> Result<Bytes> {
+        let _permit = self.requests.acquire().await.expect("never closed");
+        Ok(self.backend.get(key).await?.0)
     }
 
     /// Where an object's entry is, without a request: in this handle's packs, at a learned
@@ -851,7 +1063,11 @@ impl Objects {
             return Ok(f);
         }
         if let Some((ty, loc)) = self.index.indexed(id)? {
-            return self.read_entry(id, ty.is_data(), &loc).await;
+            match self.read_entry(id, ty.is_data(), &loc).await {
+                // GC moved it: the mirror is refreshed below.
+                Err(Error::Store(ctm_store::Error::NotFound(_))) => {}
+                other => return other,
+            }
         }
         let ty = if data {
             ObjectType::Chunk

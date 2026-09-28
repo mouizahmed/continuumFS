@@ -18,6 +18,8 @@ pub struct LocalConfig {
     pub cache: CacheConfig,
     #[serde(default)]
     pub commit: CommitConfig,
+    #[serde(default)]
+    pub retention: RetentionConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,6 +59,19 @@ impl Default for CommitConfig {
             quiet_secs: 5,
             max_dirty_secs: 60,
         }
+    }
+}
+
+/// What `ctm gc` keeps (R6).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionConfig {
+    /// Auto-commits older than this many days leave branch logs.
+    pub auto_days: u64,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> RetentionConfig {
+        RetentionConfig { auto_days: 14 }
     }
 }
 

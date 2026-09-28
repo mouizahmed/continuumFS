@@ -291,18 +291,21 @@ pub async fn run(state_dir: PathBuf) -> Result<()> {
         record.spec = branch.to_string();
         record.save()?;
     }
-    let background = if state.read_only() {
-        Vec::new()
-    } else {
-        vec![
+    let mut background = vec![tokio::spawn(record_loop(
+        state.clone(),
+        record.mount_id.clone(),
+        record.spec.clone(),
+    ))];
+    if !state.read_only() {
+        background.extend([
             tokio::spawn(push_loop(state.clone(), state_dir.clone())),
             tokio::spawn(auto_commit_loop(
                 state.clone(),
                 Duration::from_secs(config.commit.quiet_secs),
                 Duration::from_secs(config.commit.max_dirty_secs),
             )),
-        ]
-    };
+        ]);
+    }
     let adapter = fuse::FuseAdapter::new(state.clone(), tokio::runtime::Handle::current());
     let session = fuse::spawn(adapter, &record.mountpoint, state.read_only())?;
     fuse::connect_notifier(&session, &state);
@@ -355,6 +358,11 @@ pub async fn run(state_dir: PathBuf) -> Result<()> {
         task.abort();
         let _ = task.await;
     }
+    // A clean unmount has nothing left for GC to keep; after a signal the record stays until
+    // it expires, in case the working state is picked up again.
+    if unmounted && let Err(e) = state.repo().delete_mount_record(&record.mount_id).await {
+        tracing::warn!("deleting the mount record: {e}");
+    }
     drop(state);
     if !keeps_state(&record) {
         fs::remove_dir_all(&state_dir)?;
@@ -405,6 +413,27 @@ async fn push_loop(state: Arc<MountState>, state_dir: PathBuf) {
                 tokio::time::sleep(backoff + jitter).await;
                 backoff = (backoff * 2).min(Duration::from_secs(30));
             }
+        }
+    }
+}
+
+/// Keeps `mounts/<machine>.<mount>` current in the bucket (GC keeps its commit): on mount,
+/// after every push, and hourly.
+async fn record_loop(state: Arc<MountState>, mount_id: String, spec: String) {
+    loop {
+        let mounted = state
+            .branch()
+            .map_or_else(|| spec.clone(), |b| b.to_string());
+        if let Err(e) = state
+            .repo()
+            .save_mount_record(&mount_id, &mounted, state.pushed_commit())
+            .await
+        {
+            tracing::warn!("saving the mount record: {e}");
+        }
+        tokio::select! {
+            _ = state.wait_for_push() => {}
+            _ = tokio::time::sleep(Duration::from_secs(3600)) => {}
         }
     }
 }

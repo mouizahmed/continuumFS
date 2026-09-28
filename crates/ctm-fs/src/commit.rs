@@ -535,6 +535,11 @@ impl MountState {
         Ok(outcome)
     }
 
+    /// Wakes after the next successful push.
+    pub async fn wait_for_push(&self) {
+        self.pushed_notify.notified().await
+    }
+
     /// Waits until every commit made so far is pushed (the mount process pushes in the
     /// background).
     pub async fn wait_pushed(&self) -> Result<()> {

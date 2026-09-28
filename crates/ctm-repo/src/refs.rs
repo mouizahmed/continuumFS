@@ -113,7 +113,7 @@ pub struct SnapshotRef {
     pub created_by: String,
 }
 
-mod id_hex {
+pub(crate) mod id_hex {
     use serde::{Deserialize, Deserializer, Serializer, de::Error};
 
     use ctm_core::Id;

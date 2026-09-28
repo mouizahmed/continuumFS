@@ -683,3 +683,20 @@ impl Object for LogSegment {
         })
     }
 }
+
+/// The objects a stored payload of type `ty` references, in payload order ([`Object::refs`]),
+/// without the caller knowing the Rust type.
+pub fn refs_of(
+    ty: ObjectType,
+    payload: &[u8],
+    params: &FormatParams,
+) -> Result<Vec<Id>, DecodeError> {
+    Ok(match ty {
+        ObjectType::Chunk => Vec::new(),
+        ObjectType::ChunkPage => ChunkPage::decode(payload, params)?.refs(),
+        ObjectType::ChunkList => ChunkList::decode(payload, params)?.refs(),
+        ObjectType::Tree | ObjectType::LegacyTree => Tree::decode_as(ty, payload, params)?.refs(),
+        ObjectType::Commit => Commit::decode(payload, params)?.refs(),
+        ObjectType::LogSegment => LogSegment::decode(payload, params)?.refs(),
+    })
+}

@@ -816,3 +816,65 @@ fn quiet_mounts_commit_on_their_own_and_fork_includes_mounted_work() {
     assert_eq!(env.ok(&["cat", "copy:fresh.txt"]), "just written\n");
     env.ok(&["unmount", &env.path("mnt")]);
 }
+
+fn dir_bytes(dir: &Path) -> u64 {
+    let mut total = 0;
+    for e in fs::read_dir(dir).unwrap() {
+        let p = e.unwrap().path();
+        total += if p.is_dir() {
+            dir_bytes(&p)
+        } else {
+            fs::metadata(&p).unwrap().len()
+        };
+    }
+    total
+}
+
+/// R6: mounts keep a record in the bucket while they run; old auto-commits leave the log, and
+/// two `ctm gc` runs delete what only they referenced.
+#[test]
+fn gc_drops_old_auto_commits_and_deletes_what_only_they_referenced() {
+    if !fuse_available() {
+        return;
+    }
+    let env = Env::new();
+    repo_with_main(&env);
+    let config = env.home.join(".config/continuum/config.toml");
+    let text = fs::read_to_string(&config).unwrap();
+    let text = text
+        .replace("quiet_secs = 5", "quiet_secs = 1")
+        .replace("auto_days = 14", "auto_days = 0");
+    fs::write(&config, text).unwrap();
+    let bucket = Path::new(env.repo_url.strip_prefix("file://").unwrap()).to_path_buf();
+    let mnt = env.work.join("mnt");
+    fs::create_dir(&mnt).unwrap();
+    env.ok(&["mount", "main", &env.path("mnt")]);
+    assert_eq!(fs::read_dir(bucket.join("mounts")).unwrap().count(), 1);
+
+    let wait_committed = || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !env.ok(&["status", &env.path("mnt")]).contains("Changes: 0") {
+            assert!(std::time::Instant::now() < deadline, "no auto-commit");
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        env.ok(&["sync", &env.path("mnt")]);
+    };
+    fs::write(mnt.join("v.bin"), random_bytes(41, 3 << 20)).unwrap();
+    wait_committed();
+    let second = random_bytes(42, 3 << 20);
+    fs::write(mnt.join("v.bin"), &second).unwrap();
+    wait_committed();
+    env.ok(&["unmount", &env.path("mnt")]);
+    assert_eq!(fs::read_dir(bucket.join("mounts")).unwrap().count(), 0);
+
+    let before = dir_bytes(&bucket);
+    let first = env.ok(&["gc", "--grace-secs", "0"]);
+    assert!(first.contains("Retention: 1 auto-commit dropped"), "{first}");
+    let second_run = env.ok(&["gc", "--grace-secs", "0"]);
+    assert!(second_run.contains("Deleted:"), "{second_run}");
+    let after = dir_bytes(&bucket);
+    assert!(before - after >= 3 << 20, "{before} → {after}\n{second_run}");
+    assert!(env.run(&["cat", "main:v.bin"]).stdout == second);
+    assert_eq!(env.ok(&["fsck"]).trim(), "No problems found");
+    assert_eq!(env.ok(&["fsck", "main"]).trim(), "No problems found");
+}

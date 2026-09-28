@@ -4,7 +4,7 @@ use ctm_core::{Chunk, ChunkList, ChunkPage, Commit, Content, Id, LogSegment, Tre
 
 use crate::{Repo, Result};
 
-/// Test-only reachability check (exposed as `ctm fsck` in R6): from every branch and snapshot,
+/// Reachability check (`ctm fsck`): from every branch and snapshot,
 /// walks every commit in the logs and every object they reference, and checks that each one
 /// exists and hash-verifies. Returns the problems found.
 pub async fn check(repo: &Repo) -> Result<Vec<String>> {
@@ -41,6 +41,38 @@ pub async fn check(repo: &Repo) -> Result<Vec<String>> {
         match repo.read_snapshot(&name).await {
             Ok(s) => commits.push(s.commit),
             Err(e) => c.problems.push(format!("snapshot {name}: {e}")),
+        }
+    }
+    for id in commits {
+        if let Some(commit) = c.fetch::<Commit>(id, "commit").await {
+            c.tree(commit.root_tree).await;
+        }
+    }
+    Ok(c.problems)
+}
+
+/// Like [`check`], for one ref: its commit, and for a branch every commit in its log.
+pub async fn check_ref(repo: &Repo, spec: &crate::RefSpec) -> Result<Vec<String>> {
+    let mut c = Checker {
+        repo,
+        seen: HashSet::new(),
+        problems: Vec::new(),
+    };
+    let resolved = repo.resolve(spec).await?;
+    let mut commits = vec![resolved.commit];
+    if let Some((_, r, _)) = resolved.branch {
+        let mut next = Some(r.log);
+        while let Some(id) = next.take() {
+            if !c.seen.insert(id) {
+                break;
+            }
+            match repo.get::<LogSegment>(&id).await {
+                Ok(seg) => {
+                    commits.extend(seg.entries.iter().map(|e| e.commit));
+                    next = seg.prev;
+                }
+                Err(e) => c.problems.push(format!("log segment {id}: {e}")),
+            }
         }
     }
     for id in commits {

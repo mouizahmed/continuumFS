@@ -101,6 +101,19 @@ enum Command {
     },
     #[command(subcommand)]
     Cache(CacheCommand),
+    /// Collect garbage: drop old auto-commits, list what's unreachable, and delete what an
+    /// earlier run (at least a day ago) listed and is still unreachable
+    Gc {
+        /// Report what would happen, change nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// How old a dead list must be before it's swept (tests and benchmarks)
+        #[arg(long, hide = true)]
+        grace_secs: Option<u64>,
+    },
+    /// Check that everything reachable (or reachable from one ref) exists and hash-verifies;
+    /// downloads it all
+    Fsck { spec: Option<String> },
     /// Run a mount's FUSE session (started by `ctm mount`)
     #[command(hide = true)]
     MountProcess { state_dir: PathBuf },
@@ -187,6 +200,11 @@ async fn run(command: Command) -> Result<()> {
         } => mount::mount(&spec, &dir, read_only, foreground).await,
         Command::MountProcess { state_dir } => mount::run(state_dir).await,
         Command::Cache(CacheCommand::Stats { json }) => mount::cache_stats(json).await,
+        Command::Gc {
+            dry_run,
+            grace_secs,
+        } => commands::gc(dry_run, grace_secs).await,
+        Command::Fsck { spec } => commands::fsck(spec.as_deref()).await,
         Command::Unmount { dir, no_wait } => mount::unmount(&dir, no_wait).await,
         Command::Sync { dir } => mount::sync_cmd(dir.as_deref()).await,
         Command::Commit { dir, message } => mount::commit_cmd(&dir, &message).await,

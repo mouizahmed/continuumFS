@@ -3,14 +3,16 @@
 
 mod check;
 pub mod config;
+mod gc;
 mod objects;
 pub mod refs;
 pub mod refspec;
 mod repo;
 mod time;
 
-pub use check::check;
+pub use check::{check, check_ref};
 pub use config::RepoConfig;
+pub use gc::{GcOptions, GcReport, MountRecord};
 pub use objects::{Uploaded, object_key};
 pub use refs::{BranchName, BranchRef, ForkedFrom, SnapshotRef};
 pub use refspec::RefSpec;

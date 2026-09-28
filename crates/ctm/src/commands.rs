@@ -210,3 +210,60 @@ pub async fn diff(a: &str, b: &str, stat: bool) -> Result<()> {
     }
     Ok(())
 }
+
+pub async fn gc(dry_run: bool, grace_secs: Option<u64>) -> Result<()> {
+    let config = load_config()?;
+    let repo = open_repo().await?;
+    let mut opts = ctm_repo::GcOptions {
+        auto_retention: std::time::Duration::from_secs(config.retention.auto_days * 86_400),
+        dry_run,
+        ..ctm_repo::GcOptions::default()
+    };
+    if let Some(s) = grace_secs {
+        opts.grace = std::time::Duration::from_secs(s);
+    }
+    let r = repo.gc(&opts).await?;
+    let verb = if dry_run { "Would delete" } else { "Deleted" };
+    println!(
+        "Retention: {} auto-commit{} dropped from branch logs",
+        r.dropped_commits,
+        if r.dropped_commits == 1 { "" } else { "s" }
+    );
+    println!(
+        "Marked: {} objects reachable; {} unreachable and {} unindexed packs listed for a later run",
+        r.live_objects, r.newly_dead, r.new_orphans
+    );
+    println!(
+        "{verb}: {} objects in {} packs and {} loose objects, {} orphan packs; {} packs repacked; \
+         {} freed",
+        r.deleted_objects,
+        r.deleted_packs,
+        r.deleted_loose,
+        r.deleted_orphans,
+        r.repacked_packs,
+        crate::mount::human(r.freed_bytes)
+    );
+    if r.compacted_segments > 1 {
+        println!(
+            "Index: {} segments compacted into one",
+            r.compacted_segments
+        );
+    }
+    Ok(())
+}
+
+pub async fn fsck(spec: Option<&str>) -> Result<()> {
+    let repo = open_repo().await?;
+    let problems = match spec {
+        Some(s) => ctm_repo::check_ref(&repo, &s.parse()?).await?,
+        None => ctm_repo::check(&repo).await?,
+    };
+    if problems.is_empty() {
+        println!("No problems found");
+        return Ok(());
+    }
+    for p in &problems {
+        println!("{p}");
+    }
+    Err(format!("{} problems found", problems.len()).into())
+}
