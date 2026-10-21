@@ -76,6 +76,25 @@ enum Command {
     Sync { dir: Option<PathBuf> },
     /// Create a new branch from any ref
     Fork { from: String, new: String },
+    /// Merge one branch into another, entry by entry (never inside a file)
+    Merge {
+        src: String,
+        /// The branch to merge into
+        #[arg(long)]
+        into: String,
+        /// On a conflict, keep this branch's version
+        #[arg(long, group = "resolve")]
+        ours: bool,
+        /// On a conflict, take the merged branch's version
+        #[arg(long, group = "resolve")]
+        theirs: bool,
+        /// On a conflict, keep both: ours at the path, theirs next to it as <stem>.<src>.<ext>
+        #[arg(long, group = "resolve")]
+        keep_both: bool,
+        /// Report what would happen, change nothing
+        #[arg(long)]
+        dry_run: bool,
+    },
     #[command(subcommand)]
     Branch(BranchCommand),
     #[command(subcommand)]
@@ -205,6 +224,22 @@ async fn run(command: Command) -> Result<()> {
             grace_secs,
         } => commands::gc(dry_run, grace_secs).await,
         Command::Fsck { spec } => commands::fsck(spec.as_deref()).await,
+        Command::Merge {
+            src,
+            into,
+            ours,
+            theirs,
+            keep_both,
+            dry_run,
+        } => {
+            let resolve = match (ours, theirs, keep_both) {
+                (true, _, _) => Some(ctm_repo::Resolve::Ours),
+                (_, true, _) => Some(ctm_repo::Resolve::Theirs),
+                (_, _, true) => Some(ctm_repo::Resolve::KeepBoth),
+                _ => None,
+            };
+            commands::merge(&src, &into, resolve, dry_run).await
+        }
         Command::Unmount { dir, no_wait } => mount::unmount(&dir, no_wait).await,
         Command::Sync { dir } => mount::sync_cmd(dir.as_deref()).await,
         Command::Commit { dir, message } => mount::commit_cmd(&dir, &message).await,

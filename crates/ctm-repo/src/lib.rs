@@ -4,6 +4,7 @@
 mod check;
 pub mod config;
 mod gc;
+mod merge;
 mod objects;
 pub mod refs;
 pub mod refspec;
@@ -13,6 +14,7 @@ mod time;
 pub use check::{check, check_ref};
 pub use config::RepoConfig;
 pub use gc::{GcOptions, GcReport, MountRecord};
+pub use merge::{MergeOptions, MergeOutcome, Resolve};
 pub use objects::{Uploaded, object_key};
 pub use refs::{BranchName, BranchRef, ForkedFrom, SnapshotRef};
 pub use refspec::RefSpec;
@@ -42,6 +44,10 @@ pub enum Error {
     AlreadyExists(String),
     #[error("path {0:?} not found")]
     PathNotFound(String),
+    #[error(
+        "{src} and {dst} have no merge base: neither was forked from the other, and they haven't been merged"
+    )]
+    NoMergeBase { src: String, dst: String },
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

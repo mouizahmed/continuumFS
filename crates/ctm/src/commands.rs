@@ -267,3 +267,57 @@ pub async fn fsck(spec: Option<&str>) -> Result<()> {
     }
     Err(format!("{} problems found", problems.len()).into())
 }
+
+pub async fn merge(
+    src: &str,
+    dst: &str,
+    resolve: Option<ctm_repo::Resolve>,
+    dry_run: bool,
+) -> Result<()> {
+    let (src_name, dst_name) = (BranchName::new(src)?, BranchName::new(dst)?);
+    if !dry_run && let Some(at) = crate::mount::mounted_rw(dst).await {
+        return Err(format!(
+            "{dst} is mounted read-write at {}; unmount it first (merging into it would make \
+             that mount auto-fork on its next push)",
+            at.display()
+        )
+        .into());
+    }
+    // What's written in a mount of src counts.
+    crate::mount::sync_branch(src).await?;
+    let repo = open_repo().await?;
+    let opts = ctm_repo::MergeOptions { resolve, dry_run };
+    match repo.merge(&src_name, &dst_name, &opts).await? {
+        ctm_repo::MergeOutcome::UpToDate => {
+            println!("Already up to date: {dst} has everything in {src}")
+        }
+        ctm_repo::MergeOutcome::Conflicts(paths) => {
+            for p in &paths {
+                println!("conflict: {p}");
+            }
+            return Err(format!(
+                "{} conflicting path{}: nothing was merged. Pass --ours, --theirs, or --keep-both",
+                paths.len(),
+                if paths.len() == 1 { "" } else { "s" }
+            )
+            .into());
+        }
+        ctm_repo::MergeOutcome::Merged {
+            commit,
+            taken,
+            resolved,
+        } => {
+            for p in &taken {
+                println!("from {src}: {p}");
+            }
+            for p in &resolved {
+                println!("conflict resolved: {p}");
+            }
+            match commit {
+                Some(c) => println!("Merged {src} into {dst} (commit {})", short(&c)),
+                None => println!("Would merge {src} into {dst} (dry run)"),
+            }
+        }
+    }
+    Ok(())
+}

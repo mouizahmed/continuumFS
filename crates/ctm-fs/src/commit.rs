@@ -473,6 +473,7 @@ impl MountState {
                     commit: from_commit,
                     at: now.clone(),
                 }),
+                merge_bases: pushed.merge_bases.clone(),
                 updated_at: now,
                 updated_by: self.repo.identity().updated_by(),
             };

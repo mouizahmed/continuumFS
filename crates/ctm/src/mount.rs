@@ -395,7 +395,8 @@ async fn push_loop(state: Arc<MountState>, state_dir: PathBuf) {
             Ok(PushOutcome::AutoForked { from, branch, .. }) => {
                 backoff = Duration::from_millis(200);
                 tracing::warn!(
-                    "{from} moved on another machine. Your changes are safe on {branch}."
+                    "{from} moved on another machine. Your changes are safe on {branch}; \
+                     combine them with `ctm merge {branch} --into {from}`."
                 );
                 match MountRecord::load(&state_dir) {
                     Ok(mut record) => {
@@ -496,7 +497,8 @@ async fn handle(
                 let mut lines = Vec::new();
                 match (&s.branch, &s.auto_forked_from) {
                     (Some(b), Some(from)) => {
-                        lines.push(format!("Branch: {b} (auto-forked from {from})"))
+                        lines.push(format!("Branch: {b} (auto-forked from {from})"));
+                        lines.push(format!("Merge back with: ctm merge {b} --into {from}"));
                     }
                     (Some(b), None) => lines.push(format!("Branch: {b}")),
                     (None, _) => lines.push(format!("Ref: {}", record.spec)),
@@ -618,6 +620,16 @@ pub async fn commit_cmd(dir: &Path, message: &str) -> Result<()> {
         .await?
     );
     Ok(())
+}
+
+/// Where `branch` is mounted read-write on this machine, if it is (and the mount is running).
+pub async fn mounted_rw(branch: &str) -> Option<PathBuf> {
+    for record in records() {
+        if !record.read_only && record.spec == branch && alive(&record).await {
+            return Some(record.mountpoint);
+        }
+    }
+    None
 }
 
 /// `ctm sync`: waits until the mount at `dir` (or every read-write mount) has pushed every

@@ -685,6 +685,7 @@ impl Repo {
             head_hint: None,
             log_hint: None,
             forked_from: current.forked_from.clone(),
+            merge_bases: current.merge_bases.clone(),
             updated_at: rfc3339(now_ns()),
             updated_by: self.identity.updated_by(),
         })
@@ -709,6 +710,7 @@ impl Repo {
             head_hint: None,
             log_hint: None,
             forked_from,
+            merge_bases: Default::default(),
             updated_at: rfc3339(now_ns()),
             updated_by: self.identity.updated_by(),
         })
@@ -774,6 +776,8 @@ impl Repo {
                     commit,
                     at: now.clone(),
                 }),
+                // The fork's history includes these merges, so their bases hold for it too.
+                merge_bases: r.merge_bases.clone(),
                 updated_at: now,
                 updated_by: self.identity.updated_by(),
             },
@@ -844,7 +848,7 @@ impl Repo {
         Ok(out)
     }
 
-    async fn diff_dirs(
+    pub(crate) async fn diff_dirs(
         &self,
         a: Id,
         b: Id,

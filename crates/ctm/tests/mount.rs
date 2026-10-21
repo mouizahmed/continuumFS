@@ -884,3 +884,60 @@ fn gc_drops_old_auto_commits_and_deletes_what_only_they_referenced() {
     assert_eq!(env.ok(&["fsck"]).trim(), "No problems found");
     assert_eq!(env.ok(&["fsck", "main"]).trim(), "No problems found");
 }
+
+/// R7: an auto-fork merges back. A merge into a branch mounted here is refused; a conflict is
+/// refused until resolved.
+#[test]
+fn an_auto_fork_merges_back_into_its_branch() {
+    if !fuse_available() {
+        return;
+    }
+    let env = Env::new();
+    repo_with_main(&env);
+    let (a, b) = (env.work.join("a"), env.work.join("b"));
+    fs::create_dir(&a).unwrap();
+    fs::create_dir(&b).unwrap();
+    env.ok(&["mount", "main", &env.path("a")]);
+    env.ok(&["mount", "main", &env.path("b")]);
+    fs::write(a.join("from-a.txt"), "a\n").unwrap();
+    fs::write(a.join("notes.txt"), "edited on a\n").unwrap();
+    fs::write(b.join("from-b.txt"), "b\n").unwrap();
+    fs::write(b.join("notes.txt"), "edited on b\n").unwrap();
+    env.ok(&["commit", &env.path("a")]);
+    env.ok(&["sync", &env.path("a")]);
+    env.ok(&["commit", &env.path("b")]);
+    env.ok(&["sync", &env.path("b")]);
+    let status = env.ok(&["status", &env.path("b")]);
+    let fork = env
+        .ok(&["branch", "list"])
+        .lines()
+        .find(|l| *l != "main")
+        .unwrap()
+        .to_string();
+    assert!(
+        status.contains(&format!("Merge back with: ctm merge {fork} --into main")),
+        "{status}"
+    );
+    env.ok(&["unmount", &env.path("b")]);
+
+    let err = env.fails(&["merge", &fork, "--into", "main"]);
+    assert!(err.contains("mounted read-write"), "{err}");
+    env.ok(&["unmount", &env.path("a")]);
+
+    // notes.txt changed on both sides: refused, then both kept.
+    let err = env.fails(&["merge", &fork, "--into", "main"]);
+    assert!(err.contains("1 conflicting path"), "{err}");
+    let out = env.ok(&["merge", &fork, "--into", "main", "--keep-both"]);
+    assert!(out.contains(&format!("Merged {fork} into main")), "{out}");
+    assert_eq!(env.ok(&["cat", "main:from-a.txt"]), "a\n");
+    assert_eq!(env.ok(&["cat", "main:from-b.txt"]), "b\n");
+    assert_eq!(env.ok(&["cat", "main:notes.txt"]), "edited on a\n");
+    assert_eq!(
+        env.ok(&["cat", &format!("main:notes.{fork}.txt")]),
+        "edited on b\n"
+    );
+    assert!(
+        env.ok(&["merge", &fork, "--into", "main"])
+            .starts_with("Already up to date")
+    );
+}

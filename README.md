@@ -103,6 +103,7 @@ ctm status <dir>
 ctm restore <path> --at <ref>                replace a path inside a mount with its version in a ref
 
 ctm fork <from-ref> <new-branch>             ctm branch list
+ctm merge <src> --into <dst> [--ours|--theirs|--keep-both] [--dry-run]
 ctm snapshot create <name> [--from <ref>]    ctm snapshot list
 ctm log <ref> [-- <path>]                    ctm diff <ref-a> <ref-b> [--stat]
 ctm gc [--dry-run]                           drop old auto-commits, delete unreachable data
@@ -153,8 +154,8 @@ exactly what chunking the whole file would give.
 
 - **Linux only**: binaries for x86_64 and aarch64, tested on x86_64. macOS is planned; Windows is
   not.
-- **One writer per branch.** Concurrent writers are auto-forked, not merged. `ctm merge` isn't
-  there yet.
+- **One writer per branch.** Concurrent writers are auto-forked, not merged; `ctm merge` combines
+  the branches afterwards, entry by entry (never inside a file).
 - **Garbage collection runs by hand.** `ctm gc` drops auto-commits older than 14 days and deletes
   what's no longer reachable, a day after first finding it unreachable; run it periodically
   (a daily timer comes with the daemon). Manual commits and snapshots are kept until deleted, and
@@ -220,6 +221,11 @@ write, after which v0.1 refuses them.
 **In v0.4:** `ctm gc` collects garbage. After 10 edit cycles of a
 100 MiB file, the bucket went from 1,000.9 MiB to 100.0 MiB in two runs
 ([details](bench/results/r6-gc.md)); `ctm fsck` verifies what's left.
+
+**Since v0.4** (unreleased, on `main`): `ctm merge <src> --into <dst>` merges branches entry by
+entry. An entry changed on one side takes that side; one changed differently on both is a
+conflict, refused unless resolved with `--ours`, `--theirs`, or `--keep-both`. An auto-fork
+merges back with `ctm merge main.<host> --into main`.
 
 ## Development
 

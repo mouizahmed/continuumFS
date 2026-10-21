@@ -220,6 +220,15 @@ impl Repo {
     }
 }
 
+/// Commits a branch's future merges need as bases: where it was forked from, and the last
+/// commit merged in from each branch. Retention may have dropped them from every log.
+fn merge_roots(r: &BranchRef) -> impl Iterator<Item = Id> + '_ {
+    r.forked_from
+        .iter()
+        .map(|f| f.commit)
+        .chain(r.merge_bases.values().copied())
+}
+
 enum Walk {
     Commit(Id),
     Tree(Id),
@@ -448,7 +457,12 @@ impl Gc<'_> {
                 .cloned()
                 .collect();
             let dropped = entries.len() - keep.len();
-            let kept_commits: Vec<Id> = keep.iter().map(|e| e.commit).chain([r.head]).collect();
+            let kept_commits: Vec<Id> = keep
+                .iter()
+                .map(|e| e.commit)
+                .chain([r.head])
+                .chain(merge_roots(&r))
+                .collect();
             if dropped == 0 || self.opts.dry_run {
                 return Ok((segments, kept_commits, dropped));
             }
@@ -463,7 +477,12 @@ impl Gc<'_> {
         // It kept moving: leave its log as it is this time.
         let (r, _) = self.repo.read_ref(branch).await?;
         let (segments, entries) = self.read_log(r.log).await?;
-        let commits = entries.iter().map(|e| e.commit).chain([r.head]).collect();
+        let commits = entries
+            .iter()
+            .map(|e| e.commit)
+            .chain([r.head])
+            .chain(merge_roots(&r))
+            .collect();
         Ok((segments, commits, 0))
     }
 

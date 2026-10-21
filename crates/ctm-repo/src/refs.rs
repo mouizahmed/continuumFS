@@ -3,6 +3,7 @@
 //! Readers ignore fields they don't know, so later milestones can add fields (hints in R3,
 //! `last_merge_base` in R7) without breaking v0 clients.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
@@ -87,6 +88,10 @@ pub struct BranchRef {
     pub log_hint: Option<Location>,
     /// `None` for a branch made by `import`.
     pub forked_from: Option<ForkedFrom>,
+    /// For each branch merged into this one (R7): the commit of it merged last, the base for
+    /// its next merge. Kept by forks, and a GC root.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty", with = "id_map")]
+    pub merge_bases: BTreeMap<String, Id>,
     pub updated_at: String,
     /// `"<user>@<hostname>/<machine-id>"`.
     pub updated_by: String,
@@ -144,5 +149,29 @@ mod hint_hex {
         let s = Option::<String>::deserialize(d)?;
         Ok(s.and_then(|s| hex::decode(s).ok())
             .and_then(|b| Location::from_hint(&b)))
+    }
+}
+
+/// A map of names to IDs, with the IDs as hex.
+mod id_map {
+    use std::collections::BTreeMap;
+
+    use serde::{Deserialize, Deserializer, Serializer, de::Error, ser::SerializeMap};
+
+    use ctm_core::Id;
+
+    pub fn serialize<S: Serializer>(map: &BTreeMap<String, Id>, s: S) -> Result<S::Ok, S::Error> {
+        let mut m = s.serialize_map(Some(map.len()))?;
+        for (k, v) in map {
+            m.serialize_entry(k, &v.to_hex())?;
+        }
+        m.end()
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<BTreeMap<String, Id>, D::Error> {
+        BTreeMap::<String, String>::deserialize(d)?
+            .into_iter()
+            .map(|(k, v)| Ok((k, v.parse().map_err(D::Error::custom)?)))
+            .collect()
     }
 }

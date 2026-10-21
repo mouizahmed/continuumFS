@@ -755,6 +755,7 @@ async fn a_version_1_repo_is_read_and_upgraded_on_first_write() {
             head_hint: None,
             log_hint: None,
             forked_from: None,
+            merge_bases: Default::default(),
             updated_at: "2026-09-27T00:00:00Z".into(),
             updated_by: "me".into(),
         },
