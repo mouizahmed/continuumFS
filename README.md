@@ -16,9 +16,10 @@ that changed.
   about one chunk.
 - **Branches.** `fork` is one request whatever the size; `diff` skips identical subtrees; every
   commit is a snapshot of the whole tree, sharing unchanged data with the rest of the history.
-- **One writer per branch.** If two machines commit to the same branch, the one that loses the
-  race is moved to `<branch>.<hostname>` automatically. Nothing is lost and nothing is merged
-  behind your back.
+- **Mounts follow their branch.** A mount picks up what other machines push to its branch within
+  seconds, keeping its own uncommitted changes. If both changed the same file, the one that
+  loses the race is moved to `<branch>.<hostname>` automatically. Nothing is lost, and files are
+  never merged behind your back.
 
 It is written in Rust as a single binary (`ctm`), Apache-2.0.
 
@@ -100,11 +101,15 @@ ctm unmount <dir> [--no-wait]                commits, and waits for the push unl
 ctm commit <dir> [-m msg]                    commit now (mounts also commit on their own)
 ctm sync [<dir>]                             wait until every commit is pushed
 ctm status <dir>
+ctm update <dir>                             catch up with the branch now (mounts do it on their own)
 ctm restore <path> --at <ref>                replace a path inside a mount with its version in a ref
 
-ctm fork <from-ref> <new-branch>             ctm branch list
+ctm fork <from-ref> <new-branch>             ctm branch list [--deleted]
+ctm branch delete|undelete <name>            ctm branch rename <old> <new>
 ctm merge <src> --into <dst> [--ours|--theirs|--keep-both] [--dry-run]
-ctm snapshot create <name> [--from <ref>]    ctm snapshot list
+ctm reset <branch> --to <ref>                point a branch back (the old head stays in its log)
+ctm snapshot create <name> [--from <ref>]    ctm snapshot list [--deleted]
+ctm snapshot delete|undelete <name>
 ctm log <ref> [-- <path>]                    ctm diff <ref-a> <ref-b> [--stat]
 ctm gc [--dry-run]                           drop old auto-commits, delete unreachable data
 ctm fsck [<ref>]                             verify everything reachable (downloads it)
@@ -154,14 +159,13 @@ exactly what chunking the whole file would give.
 
 - **Linux only**: binaries for x86_64 and aarch64, tested on x86_64. macOS is planned; Windows is
   not.
-- **One writer per branch.** Concurrent writers are auto-forked, not merged; `ctm merge` combines
-  the branches afterwards, entry by entry (never inside a file).
-- **Garbage collection runs by hand.** `ctm gc` drops auto-commits older than 14 days and deletes
-  what's no longer reachable, a day after first finding it unreachable; run it periodically
-  (a daily timer comes with the daemon). Manual commits and snapshots are kept until deleted, and
-  branches can't be deleted yet.
-- **Mounts see only their own writes.** Changes committed elsewhere show up in a new mount, not
-  an existing one (`ctm status` says when the branch has moved).
+- **Files aren't merged.** When two machines change the same file on one branch, one of them is
+  auto-forked; `ctm merge` combines the branches afterwards, entry by entry (never inside a file).
+- **Garbage collection.** Read-write mounts run `ctm gc` once a day (`[gc] auto_hours`), and it
+  can be run by hand. It drops auto-commits older than 14 days (other commits only if
+  `[retention] manual_days` is set) and deletes what's no longer reachable, a day after first
+  finding it unreachable. Deleted branches and snapshots keep their data for 7 days, during which
+  they can be undeleted.
 - **Not supported:** hard links (`EPERM`), xattrs, FIFOs, sockets, and device nodes (`ENOTSUP`),
   `RENAME_EXCHANGE`, `fallocate`. Everything appears owned by the mounting user. `mmap` works but
   isn't tested yet.
@@ -239,6 +243,12 @@ merges back with `ctm merge main.<host> --into main`.
 | New dataset version (80 whole images), median | 7.0 s | 7.0 s | **3.4 s** |
 
 Whole-file changes cost the same in all three; the difference is edits inside large files.
+
+**Since v0.5** (unreleased, on `main`): mounts follow their branch, picking up other machines'
+pushes within seconds while keeping uncommitted changes (`ctm update` does it at once); `ctm
+merge` and `ctm reset` update mounts of the branch too. Branches and snapshots can be deleted and
+undeleted for 7 days, and branches renamed; `ctm reset` points a branch back. Mounts run GC once
+a day, and `[retention] manual_days` lets it drop old manual commits.
 
 ## Development
 
