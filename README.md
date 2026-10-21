@@ -2,7 +2,7 @@
 
 **Git branches for whole workspaces, backed by a bucket. No servers.**
 
-Continuum is a filesystem for Linux that stores everything — file data, directories, history — as
+Continuum is a filesystem for Linux that stores everything (file data, directories, history) as
 immutable, content-addressed objects in an S3-compatible bucket. You mount a branch, work in it
 like any directory, and commit. Forking a branch of any size is a single request, file contents
 are downloaded only when something reads them, and editing a huge file uploads only the part

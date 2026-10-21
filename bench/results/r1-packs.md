@@ -12,7 +12,7 @@ BENCH_RESULTS=… bench/baseline.sh npm
 | # | Benchmark | v0.1.0 (before) | 0.2.0-dev with R1 (after) |
 |---|---|---|---|
 | 5 | Commit a clone of nest v11.2.6 + `node_modules` (60,459 files) | 110 s; 15,949 objects PUT, 355 MiB | 14.9 s; 13 objects PUT, 357 MiB |
-| — | Import the Linux kernel tree (95,972 files) | 550 s; 53,048 objects PUT, 1.8 GiB | 46.6 s; 60 objects PUT, 1.8 GiB |
+|   | Import the Linux kernel tree (95,972 files) | 550 s; 53,048 objects PUT, 1.8 GiB | 46.6 s; 60 objects PUT, 1.8 GiB |
 | 7 | Cold `find` over the kernel tree (102,372 entries), empty caches | 20.3 s | 12.4 s |
 | 4 | `npm ci` in a mount vs. local btrfs (not affected by R1) | 23.0 s vs. 6.4 s | 26.9 s vs. 6.8 s |
 
