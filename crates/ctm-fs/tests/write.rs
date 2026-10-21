@@ -755,6 +755,8 @@ async fn format_1_entries_get_file_ids_when_their_directory_is_committed() {
             log_hint: None,
             forked_from: None,
             merge_bases: Default::default(),
+            id: None,
+            deleted_at: None,
             updated_at: "2026-09-27T00:00:00Z".into(),
             updated_by: "me".into(),
         },

@@ -472,8 +472,11 @@ impl MountState {
                     from: branch.to_string(),
                     commit: from_commit,
                     at: now.clone(),
+                    id: base.branch_ref.as_ref().map(|r| r.key(&branch)),
                 }),
                 merge_bases: pushed.merge_bases.clone(),
+                id: Some(ctm_repo::new_branch_id()),
+                deleted_at: None,
                 updated_at: now,
                 updated_by: self.repo.identity().updated_by(),
             };

@@ -112,6 +112,12 @@ enum Command {
         #[arg(long)]
         stat: bool,
     },
+    /// Point a branch back at another ref's commit (the old head stays in its log)
+    Reset {
+        branch: String,
+        #[arg(long)]
+        to: String,
+    },
     /// Replace a path inside a mount with its version in a ref
     Restore {
         path: PathBuf,
@@ -140,7 +146,17 @@ enum Command {
 
 #[derive(Subcommand)]
 enum BranchCommand {
-    List,
+    List {
+        /// List branches deleted in the last 7 days instead (they can be undeleted)
+        #[arg(long)]
+        deleted: bool,
+    },
+    /// Delete a branch; `ctm branch undelete` brings it back within 7 days
+    Delete { name: String },
+    /// Restore a branch deleted in the last 7 days
+    Undelete { name: String },
+    /// Rename a branch; merges and forks still recognize it
+    Rename { old: String, new: String },
 }
 
 #[derive(Subcommand)]
@@ -150,7 +166,15 @@ enum SnapshotCommand {
         #[arg(long)]
         from: Option<String>,
     },
-    List,
+    List {
+        /// List snapshots deleted in the last 7 days instead (they can be undeleted)
+        #[arg(long)]
+        deleted: bool,
+    },
+    /// Delete a snapshot; `ctm snapshot undelete` brings it back within 7 days
+    Delete { name: String },
+    /// Restore a snapshot deleted in the last 7 days
+    Undelete { name: String },
 }
 
 #[derive(Subcommand)]
@@ -204,11 +228,25 @@ async fn run(command: Command) -> Result<()> {
         Command::Ls { spec } => commands::ls(&spec).await,
         Command::Cat { spec } => commands::cat(&spec).await,
         Command::Fork { from, new } => commands::fork(&from, &new).await,
-        Command::Branch(BranchCommand::List) => commands::branch_list().await,
+        Command::Branch(BranchCommand::List { deleted }) => commands::branch_list(deleted).await,
+        Command::Branch(BranchCommand::Delete { name }) => commands::branch_delete(&name).await,
+        Command::Branch(BranchCommand::Undelete { name }) => commands::branch_undelete(&name).await,
+        Command::Branch(BranchCommand::Rename { old, new }) => {
+            commands::branch_rename(&old, &new).await
+        }
+        Command::Reset { branch, to } => commands::reset(&branch, &to).await,
         Command::Snapshot(SnapshotCommand::Create { name, from }) => {
             commands::snapshot_create(&name, from.as_deref()).await
         }
-        Command::Snapshot(SnapshotCommand::List) => commands::snapshot_list().await,
+        Command::Snapshot(SnapshotCommand::List { deleted }) => {
+            commands::snapshot_list(deleted).await
+        }
+        Command::Snapshot(SnapshotCommand::Delete { name }) => {
+            commands::snapshot_delete(&name).await
+        }
+        Command::Snapshot(SnapshotCommand::Undelete { name }) => {
+            commands::snapshot_undelete(&name).await
+        }
         Command::Log { spec, path } => commands::log(&spec, path.as_deref()).await,
         Command::Diff { a, b, stat } => commands::diff(&a, &b, stat).await,
         Command::Mount {

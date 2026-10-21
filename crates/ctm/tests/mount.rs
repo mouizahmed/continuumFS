@@ -869,10 +869,7 @@ fn gc_drops_old_auto_commits_and_deletes_what_only_they_referenced() {
 
     let before = dir_bytes(&bucket);
     let first = env.ok(&["gc", "--grace-secs", "0"]);
-    assert!(
-        first.contains("Retention: 1 auto-commit dropped"),
-        "{first}"
-    );
+    assert!(first.contains("Retention: 1 commit dropped"), "{first}");
     let second_run = env.ok(&["gc", "--grace-secs", "0"]);
     assert!(second_run.contains("Deleted:"), "{second_run}");
     let after = dir_bytes(&bucket);
@@ -939,5 +936,89 @@ fn an_auto_fork_merges_back_into_its_branch() {
     assert!(
         env.ok(&["merge", &fork, "--into", "main"])
             .starts_with("Already up to date")
+    );
+}
+
+/// v0.6: a branch deleted on another machine while mounted here: the mount's next push
+/// auto-forks instead of failing or landing on the deleted ref, and the branch can be undeleted.
+/// Deleting, renaming, or resetting a branch mounted here is refused.
+#[test]
+fn a_mount_whose_branch_is_deleted_elsewhere_auto_forks() {
+    if !fuse_available() {
+        return;
+    }
+    let env = Env::new();
+    repo_with_main(&env);
+    let mut other = Env::new();
+    other.repo_url = env.repo_url.clone();
+    other.init();
+
+    let a = env.work.join("a");
+    fs::create_dir(&a).unwrap();
+    env.ok(&["mount", "main", &env.path("a")]);
+    for args in [
+        vec!["branch", "delete", "main"],
+        vec!["branch", "rename", "main", "x"],
+        vec!["reset", "main", "--to", "main"],
+    ] {
+        let err = env.fails(&args);
+        assert!(err.contains("mounted read-write"), "{err}");
+    }
+
+    let out = other.ok(&["branch", "delete", "main"]);
+    assert!(out.contains("Deleted branch main"), "{out}");
+    assert!(
+        other
+            .ok(&["branch", "list", "--deleted"])
+            .starts_with("main ")
+    );
+
+    fs::write(a.join("after.txt"), "written after the delete\n").unwrap();
+    env.ok(&["commit", &env.path("a")]);
+    env.ok(&["sync", &env.path("a")]);
+    let status = env.ok(&["status", &env.path("a")]);
+    assert!(status.contains("auto-forked from main"), "{status}");
+    env.ok(&["unmount", &env.path("a")]);
+    let fork = env
+        .ok(&["branch", "list"])
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(fork.starts_with("main."), "{fork}");
+    assert_eq!(
+        env.ok(&["cat", &format!("{fork}:after.txt")]),
+        "written after the delete\n"
+    );
+
+    other.ok(&["branch", "undelete", "main"]);
+    assert_eq!(env.ok(&["cat", "main:notes.txt"]), "hello\n");
+    assert!(env.fails(&["cat", "main:after.txt"]).contains("not found"));
+    let out = env.ok(&["merge", &fork, "--into", "main"]);
+    assert!(out.contains("after.txt"), "{out}");
+
+    // Rename, reset, and snapshot delete through the CLI.
+    env.ok(&["branch", "rename", &fork, "laptop"]);
+    let first = env.ok(&["log", "main"]).lines().last().unwrap()[..12].to_string();
+    env.ok(&["reset", "main", "--to", &first]);
+    assert!(env.fails(&["cat", "main:after.txt"]).contains("not found"));
+    assert!(
+        env.ok(&["log", "main"])
+            .lines()
+            .next()
+            .unwrap()
+            .contains("reset")
+    );
+    env.ok(&["snapshot", "create", "v1", "--from", "laptop"]);
+    env.ok(&["snapshot", "delete", "v1"]);
+    assert!(env.ok(&["snapshot", "list"]).is_empty());
+    assert!(
+        env.ok(&["snapshot", "list", "--deleted"])
+            .starts_with("v1 ")
+    );
+    env.ok(&["snapshot", "undelete", "v1"]);
+    assert_eq!(
+        env.ok(&["cat", "snap/v1:after.txt"]),
+        "written after the delete\n"
     );
 }

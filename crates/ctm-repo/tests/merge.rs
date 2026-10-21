@@ -141,7 +141,7 @@ async fn changes_on_both_sides_merge_and_the_next_merge_starts_from_there() {
     );
     let (r, _) = repo.read_ref(&name("main")).await.unwrap();
     let (f, _) = repo.read_ref(&name("feature")).await.unwrap();
-    assert_eq!(r.merge_bases["feature"], f.head);
+    assert_eq!(r.merge_bases[&f.key(&name("feature"))], f.head);
     let log = repo.log(&spec("main"), None).await.unwrap();
     assert_eq!(log[0].message, "merge feature into main");
 

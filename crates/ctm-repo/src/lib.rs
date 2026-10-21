@@ -3,6 +3,7 @@
 
 mod check;
 pub mod config;
+mod delete;
 mod gc;
 mod merge;
 mod objects;
@@ -13,10 +14,11 @@ mod time;
 
 pub use check::{check, check_ref};
 pub use config::RepoConfig;
+pub use delete::{Deleted, TOMBSTONE_DAYS};
 pub use gc::{GcOptions, GcReport, MountRecord};
 pub use merge::{MergeOptions, MergeOutcome, Resolve};
 pub use objects::{Uploaded, object_key};
-pub use refs::{BranchName, BranchRef, ForkedFrom, SnapshotRef};
+pub use refs::{BranchName, BranchRef, ForkedFrom, SnapshotRef, new_branch_id};
 pub use refspec::RefSpec;
 pub use repo::{Identity, Imported, InitOutcome, PathChange, Repo, Resolved, new_file_id};
 pub use time::{now_ns, rfc3339};

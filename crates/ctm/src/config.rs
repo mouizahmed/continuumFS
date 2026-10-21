@@ -67,11 +67,18 @@ impl Default for CommitConfig {
 pub struct RetentionConfig {
     /// Auto-commits older than this many days leave branch logs.
     pub auto_days: u64,
+    /// Every other commit (manual, merge, import, …) older than this many days leaves branch
+    /// logs too; 0 keeps them. A branch's head is always kept.
+    #[serde(default)]
+    pub manual_days: u64,
 }
 
 impl Default for RetentionConfig {
     fn default() -> RetentionConfig {
-        RetentionConfig { auto_days: 14 }
+        RetentionConfig {
+            auto_days: 14,
+            manual_days: 0,
+        }
     }
 }
 

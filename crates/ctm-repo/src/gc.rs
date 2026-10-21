@@ -1,7 +1,9 @@
 //! Garbage collection and retention (R6): `ctm gc`.
 //!
-//! A run takes the GC lease, drops old auto-commits from branch logs, marks everything
-//! reachable from branches, snapshots, and live mount records, and lists what isn't in a new
+//! A run takes the GC lease, drops old commits from branch logs (auto-commits after
+//! `[retention] auto_days`, others after `manual_days` if set), marks everything reachable from
+//! branches, snapshots, tombstones of refs deleted within [`TOMBSTONE_DAYS`](crate::TOMBSTONE_DAYS), and live mount
+//! records, and lists what isn't in a new
 //! dead list (`index/dead/<unix-secs>-<random>`). It then sweeps what earlier dead lists, at
 //! least a grace period old, listed and is still unreachable: whole packs are deleted, packs
 //! under half live are repacked, loose objects and orphan packs are deleted, and the index is
@@ -29,7 +31,11 @@ use ctm_core::{
 };
 use ctm_store::PutMode;
 
-use crate::refs::{BranchName, BranchRef, id_hex};
+use crate::delete::TOMBSTONE_TTL;
+use crate::refs::{
+    BranchName, BranchRef, BranchTombstone, SNAPSHOT_TOMBSTONES, SnapshotTombstone, TOMBSTONES,
+    id_hex, parse_tombstone_key,
+};
 use crate::time::{now_ns, parse_rfc3339, rfc3339};
 use crate::{Error, Repo, Result};
 
@@ -42,6 +48,11 @@ const RETENTION_TRIES: usize = 5;
 pub struct GcOptions {
     /// Auto-commits older than this leave branch logs (`[retention] auto_days`).
     pub auto_retention: Duration,
+    /// Other commits older than this leave branch logs (`[retention] manual_days`); `None`
+    /// keeps them until their branch is deleted.
+    pub manual_retention: Option<Duration>,
+    /// Tombstones younger than this keep what the deleted ref reached (and can be undeleted).
+    pub tombstone_ttl: Duration,
     /// How old a dead list must be before what it lists (if still unreachable) is deleted.
     pub grace: Duration,
     /// Mount records seen within this long keep their base commits.
@@ -56,6 +67,8 @@ impl Default for GcOptions {
     fn default() -> GcOptions {
         GcOptions {
             auto_retention: Duration::from_secs(14 * 86_400),
+            manual_retention: None,
+            tombstone_ttl: TOMBSTONE_TTL,
             grace: Duration::from_secs(86_400),
             mount_ttl: Duration::from_secs(30 * 86_400),
             lock_stale: Duration::from_secs(6 * 3600),
@@ -66,8 +79,10 @@ impl Default for GcOptions {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct GcReport {
-    /// Auto-commits dropped from branch logs by retention.
+    /// Commits dropped from branch logs by retention.
     pub dropped_commits: usize,
+    /// Tombstones of refs deleted more than [`TOMBSTONE_DAYS`](crate::TOMBSTONE_DAYS) ago, removed.
+    pub expired_tombstones: usize,
     pub live_objects: usize,
     /// Unreachable objects listed by this run, for a later run to delete.
     pub newly_dead: usize,
@@ -258,6 +273,42 @@ impl Gc<'_> {
         for name in self.repo.list_snapshots().await? {
             commits.push(self.repo.read_snapshot(&name).await?.commit);
         }
+        // Deleted refs that can still be undeleted keep everything they reached.
+        let ttl_secs = self.opts.tombstone_ttl.as_secs() as i64;
+        for key in self.repo.backend().list(TOMBSTONES).await? {
+            let snapshot = key.starts_with(SNAPSHOT_TOMBSTONES);
+            let prefix = if snapshot {
+                SNAPSHOT_TOMBSTONES
+            } else {
+                TOMBSTONES
+            };
+            let Some((_, secs)) = parse_tombstone_key(&key, prefix) else {
+                continue;
+            };
+            if now / 1_000_000_000 - secs > ttl_secs {
+                if !self.opts.dry_run {
+                    self.repo.backend().delete(&key).await?;
+                }
+                report.expired_tombstones += 1;
+                continue;
+            }
+            let (body, _) = self.repo.backend().get(&key).await?;
+            let corrupt = |e: serde_json::Error| Error::CorruptJson {
+                what: key.clone(),
+                detail: e.to_string(),
+            };
+            if snapshot {
+                let t: SnapshotTombstone = serde_json::from_slice(&body).map_err(corrupt)?;
+                commits.push(t.snapshot.commit);
+            } else {
+                let t: BranchTombstone = serde_json::from_slice(&body).map_err(corrupt)?;
+                let (segments, entries) = self.read_log(t.branch.log).await?;
+                live.extend(segments);
+                commits.extend(entries.iter().map(|e| e.commit));
+                commits.push(t.branch.head);
+                commits.extend(merge_roots(&t.branch));
+            }
+        }
         for key in self.repo.backend().list("mounts/").await? {
             let Ok((body, _)) = self.repo.backend().get(&key).await else {
                 continue;
@@ -442,6 +493,10 @@ impl Gc<'_> {
     /// kept, and how many commits were dropped.
     async fn retain(&self, branch: &BranchName, now: i64) -> Result<(Vec<Id>, Vec<Id>, usize)> {
         let cutoff = now - self.opts.auto_retention.as_nanos() as i64;
+        let manual_cutoff = self
+            .opts
+            .manual_retention
+            .map(|d| now - d.as_nanos() as i64);
         for _ in 0..RETENTION_TRIES {
             let (r, etag) = match self.repo.read_ref(branch).await {
                 Ok(x) => x,
@@ -452,7 +507,12 @@ impl Gc<'_> {
             let keep: Vec<LogEntry> = entries
                 .iter()
                 .filter(|e| {
-                    !(e.kind == CommitKind::Auto && e.time_ns < cutoff && e.commit != r.head)
+                    let old = if e.kind == CommitKind::Auto {
+                        e.time_ns < cutoff
+                    } else {
+                        manual_cutoff.is_some_and(|c| e.time_ns < c)
+                    };
+                    !old || e.commit == r.head
                 })
                 .cloned()
                 .collect();

@@ -26,7 +26,7 @@ use ctm_store::{Backend, ETag, PutMode};
 
 use crate::config::FORMAT_VERSION;
 use crate::objects::{Objects, Uploaded, object_key};
-use crate::refs::{BranchName, BranchRef, ForkedFrom, SnapshotRef};
+use crate::refs::{BranchName, BranchRef, ForkedFrom, SnapshotRef, new_branch_id};
 use crate::refspec::{RefSpec, RefTarget};
 use crate::time::{now_ns, rfc3339};
 use crate::{Error, RepoConfig, Result};
@@ -229,7 +229,17 @@ impl Repo {
 
     // Refs
 
+    /// A branch's ref. One being deleted (`deleted_at` set) is `UnknownRef`.
     pub async fn read_ref(&self, name: &BranchName) -> Result<(BranchRef, ETag)> {
+        let (r, etag) = self.read_ref_any(name).await?;
+        if r.deleted_at.is_some() {
+            return Err(Error::UnknownRef(name.to_string()));
+        }
+        Ok((r, etag))
+    }
+
+    /// A branch's ref, even one marked deleted.
+    pub(crate) async fn read_ref_any(&self, name: &BranchName) -> Result<(BranchRef, ETag)> {
         let (bytes, etag) = match self.backend.get(&name.branch_key()).await {
             Ok(x) => x,
             Err(ctm_store::Error::NotFound(_)) => {
@@ -269,13 +279,26 @@ impl Repo {
             .await
         {
             Err(ctm_store::Error::PreconditionFailed(_)) => {
-                Err(Error::AlreadyExists(format!("branch {name}")))
+                // A ref left marked deleted (by a delete that stopped before removing it) is
+                // free to take.
+                match self.read_ref_any(name).await {
+                    Ok((old, etag)) if old.deleted_at.is_some() => {
+                        match self.cas_ref(name, new, &etag).await {
+                            Err(Error::Store(ctm_store::Error::PreconditionFailed(_))) => {
+                                Err(Error::AlreadyExists(format!("branch {name}")))
+                            }
+                            r => r,
+                        }
+                    }
+                    _ => Err(Error::AlreadyExists(format!("branch {name}"))),
+                }
             }
             r => Ok(r?),
         }
     }
 
-    /// `If-Match: expected`. A lost race is `Error::Store(PreconditionFailed)`.
+    /// `If-Match: expected`. A lost race is `Error::Store(PreconditionFailed)`, including when
+    /// the ref was deleted meanwhile (which some stores answer with 404).
     pub async fn cas_ref(
         &self,
         name: &BranchName,
@@ -283,14 +306,17 @@ impl Repo {
         expected: &ETag,
     ) -> Result<ETag> {
         let body = self.ref_body(new).await?;
-        Ok(self
+        let key = name.branch_key();
+        match self
             .backend
-            .put(
-                &name.branch_key(),
-                body.into(),
-                PutMode::IfMatch(expected.clone()),
-            )
-            .await?)
+            .put(&key, body.into(), PutMode::IfMatch(expected.clone()))
+            .await
+        {
+            Err(ctm_store::Error::NotFound(_)) => {
+                Err(ctm_store::Error::PreconditionFailed(key).into())
+            }
+            r => Ok(r?),
+        }
     }
 
     pub async fn list_branches(&self) -> Result<Vec<BranchName>> {
@@ -686,6 +712,8 @@ impl Repo {
             log_hint: None,
             forked_from: current.forked_from.clone(),
             merge_bases: current.merge_bases.clone(),
+            id: current.id.clone(),
+            deleted_at: None,
             updated_at: rfc3339(now_ns()),
             updated_by: self.identity.updated_by(),
         })
@@ -711,6 +739,8 @@ impl Repo {
             log_hint: None,
             forked_from,
             merge_bases: Default::default(),
+            id: Some(new_branch_id()),
+            deleted_at: None,
             updated_at: rfc3339(now_ns()),
             updated_by: self.identity.updated_by(),
         })
@@ -775,9 +805,12 @@ impl Repo {
                     from: name.to_string(),
                     commit,
                     at: now.clone(),
+                    id: Some(r.key(&name)),
                 }),
                 // The fork's history includes these merges, so their bases hold for it too.
                 merge_bases: r.merge_bases.clone(),
+                id: Some(new_branch_id()),
+                deleted_at: None,
                 updated_at: now,
                 updated_by: self.identity.updated_by(),
             },
@@ -797,6 +830,7 @@ impl Repo {
                     from,
                     commit,
                     at: now,
+                    id: None,
                 };
                 self.fresh_ref(commit, entry, Some(forked)).await?
             }

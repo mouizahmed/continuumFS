@@ -174,7 +174,7 @@ impl Repo {
                     }],
                 )
                 .await?;
-            next.merge_bases.insert(src.to_string(), s.head);
+            next.merge_bases.insert(s.key(src), s.head);
             match self.cas_ref(dst, &next, &etag).await {
                 Ok(_) => {
                     return Ok(MergeOutcome::Merged {
@@ -201,18 +201,21 @@ impl Repo {
         d: &crate::BranchRef,
     ) -> Result<Id> {
         let mut candidates = Vec::new();
-        candidates.extend(d.merge_bases.get(src.as_str()).copied());
-        candidates.extend(s.merge_bases.get(dst.as_str()).copied());
-        if let Some(f) = s.forked_from.as_ref().filter(|f| f.from == dst.as_str()) {
+        // Branches are known by their keys, not names: a branch deleted and made again under
+        // the same name shares nothing with the old one.
+        let (skey, dkey) = (s.key(src), d.key(dst));
+        candidates.extend(d.merge_bases.get(&skey).copied());
+        candidates.extend(s.merge_bases.get(&dkey).copied());
+        if let Some(f) = s.forked_from.as_ref().filter(|f| f.parent_key() == dkey) {
             candidates.push(f.commit);
         }
-        if let Some(f) = d.forked_from.as_ref().filter(|f| f.from == src.as_str()) {
+        if let Some(f) = d.forked_from.as_ref().filter(|f| f.parent_key() == skey) {
             candidates.push(f.commit);
         }
         let time = |c: Id| async move { Ok::<_, Error>(self.get::<Commit>(&c).await?.time_ns) };
         // Siblings, forked from the same branch: the earlier fork point is in both.
         if let (Some(sf), Some(df)) = (&s.forked_from, &d.forked_from)
-            && sf.from == df.from
+            && sf.parent_key() == df.parent_key()
         {
             let earlier = if time(sf.commit).await? <= time(df.commit).await? {
                 sf.commit

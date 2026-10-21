@@ -141,10 +141,90 @@ pub async fn fork(from: &str, new: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn branch_list() -> Result<()> {
-    for name in open_repo().await?.list_branches().await? {
+pub async fn branch_list(deleted: bool) -> Result<()> {
+    let repo = open_repo().await?;
+    if deleted {
+        return print_deleted(&repo, false).await;
+    }
+    for name in repo.list_branches().await? {
         println!("{name}");
     }
+    Ok(())
+}
+
+/// Refuses to change a branch mounted read-write on this machine: the mount would auto-fork
+/// on its next push.
+async fn refuse_mounted(branch: &str, what: &str) -> Result<()> {
+    if let Some(at) = crate::mount::mounted_rw(branch).await {
+        return Err(format!(
+            "{branch} is mounted read-write at {}; unmount it before you {what} it",
+            at.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+async fn print_deleted(repo: &Repo, snapshots: bool) -> Result<()> {
+    let now = ctm_repo::now_ns() / 1_000_000_000;
+    for d in repo.list_deleted().await? {
+        if d.snapshot == snapshots {
+            let left = ctm_repo::TOMBSTONE_DAYS as i64 * 86_400 - (now - d.deleted_at);
+            println!(
+                "{}  deleted {}, undeletable for {} more",
+                d.name,
+                ctm_repo::rfc3339(d.deleted_at * 1_000_000_000),
+                duration(left.max(0) as u64)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn duration(secs: u64) -> String {
+    match secs {
+        s if s >= 86_400 => format!("{} d", s / 86_400),
+        s if s >= 3600 => format!("{} h", s / 3600),
+        s => format!("{} min", s / 60),
+    }
+}
+
+pub async fn branch_delete(name: &str) -> Result<()> {
+    refuse_mounted(name, "delete").await?;
+    let repo = open_repo().await?;
+    let r = repo.delete_branch(&BranchName::new(name)?).await?;
+    println!(
+        "Deleted branch {name} (was {}); `ctm branch undelete {name}` restores it for {} days",
+        short(&r.head),
+        ctm_repo::TOMBSTONE_DAYS
+    );
+    Ok(())
+}
+
+pub async fn branch_undelete(name: &str) -> Result<()> {
+    let repo = open_repo().await?;
+    let r = repo.undelete_branch(&BranchName::new(name)?).await?;
+    println!("Restored branch {name} (commit {})", short(&r.head));
+    Ok(())
+}
+
+pub async fn branch_rename(old: &str, new: &str) -> Result<()> {
+    refuse_mounted(old, "rename").await?;
+    let repo = open_repo().await?;
+    repo.rename_branch(&BranchName::new(old)?, &BranchName::new(new)?)
+        .await?;
+    println!("Renamed branch {old} → {new}");
+    Ok(())
+}
+
+pub async fn reset(branch: &str, to: &str) -> Result<()> {
+    refuse_mounted(branch, "reset").await?;
+    let repo = open_repo().await?;
+    let r = repo.reset(&BranchName::new(branch)?, &to.parse()?).await?;
+    println!(
+        "Reset {branch} to {to} (commit {}); the old head stays in `ctm log {branch}`",
+        short(&r.head)
+    );
     Ok(())
 }
 
@@ -159,10 +239,31 @@ pub async fn snapshot_create(name: &str, from: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-pub async fn snapshot_list() -> Result<()> {
-    for name in open_repo().await?.list_snapshots().await? {
+pub async fn snapshot_list(deleted: bool) -> Result<()> {
+    let repo = open_repo().await?;
+    if deleted {
+        return print_deleted(&repo, true).await;
+    }
+    for name in repo.list_snapshots().await? {
         println!("{name}");
     }
+    Ok(())
+}
+
+pub async fn snapshot_delete(name: &str) -> Result<()> {
+    let repo = open_repo().await?;
+    repo.delete_snapshot(&BranchName::new(name)?).await?;
+    println!(
+        "Deleted snapshot {name}; `ctm snapshot undelete {name}` restores it for {} days",
+        ctm_repo::TOMBSTONE_DAYS
+    );
+    Ok(())
+}
+
+pub async fn snapshot_undelete(name: &str) -> Result<()> {
+    let repo = open_repo().await?;
+    repo.undelete_snapshot(&BranchName::new(name)?).await?;
+    println!("Restored snapshot {name}");
     Ok(())
 }
 
@@ -216,6 +317,8 @@ pub async fn gc(dry_run: bool, grace_secs: Option<u64>) -> Result<()> {
     let repo = open_repo().await?;
     let mut opts = ctm_repo::GcOptions {
         auto_retention: std::time::Duration::from_secs(config.retention.auto_days * 86_400),
+        manual_retention: (config.retention.manual_days > 0)
+            .then(|| std::time::Duration::from_secs(config.retention.manual_days * 86_400)),
         dry_run,
         ..ctm_repo::GcOptions::default()
     };
@@ -225,9 +328,11 @@ pub async fn gc(dry_run: bool, grace_secs: Option<u64>) -> Result<()> {
     let r = repo.gc(&opts).await?;
     let verb = if dry_run { "Would delete" } else { "Deleted" };
     println!(
-        "Retention: {} auto-commit{} dropped from branch logs",
+        "Retention: {} commit{} dropped from branch logs; {} expired tombstone{} removed",
         r.dropped_commits,
-        if r.dropped_commits == 1 { "" } else { "s" }
+        if r.dropped_commits == 1 { "" } else { "s" },
+        r.expired_tombstones,
+        if r.expired_tombstones == 1 { "" } else { "s" }
     );
     println!(
         "Marked: {} objects reachable; {} unreachable and {} unindexed packs listed for a later run",

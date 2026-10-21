@@ -1,7 +1,7 @@
 //! Branch and snapshot refs: small JSON objects under `refs/`.
 //!
 //! Readers ignore fields they don't know, so later milestones can add fields (hints in R3,
-//! `last_merge_base` in R7) without breaking v0 clients.
+//! `merge_bases` in R7, `id` and `deleted_at` in v0.6) without breaking v0 clients.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -67,6 +67,35 @@ impl BranchName {
     pub fn snapshot_key(&self) -> String {
         format!("refs/snapshots/{}", self.0)
     }
+
+    /// Where a deleted branch's tombstone goes: `refs/deleted/<name>.<unix-secs>`.
+    pub fn branch_tombstone_key(&self, secs: i64) -> String {
+        format!("{TOMBSTONES}{}.{secs}", self.0)
+    }
+
+    /// Where a deleted snapshot's tombstone goes: `refs/deleted/snap/<name>.<unix-secs>`.
+    pub fn snapshot_tombstone_key(&self, secs: i64) -> String {
+        format!("{SNAPSHOT_TOMBSTONES}{}.{secs}", self.0)
+    }
+}
+
+/// Tombstones of deleted branches; snapshots' are under `snap/` (names can't contain `/`).
+pub const TOMBSTONES: &str = "refs/deleted/";
+pub const SNAPSHOT_TOMBSTONES: &str = "refs/deleted/snap/";
+
+/// A tombstone key's name and deletion time; `None` for anything else.
+pub fn parse_tombstone_key(key: &str, prefix: &str) -> Option<(BranchName, i64)> {
+    let rest = key.strip_prefix(prefix)?;
+    let (name, secs) = rest.rsplit_once('.')?;
+    Some((BranchName::new(name).ok()?, secs.parse().ok()?))
+}
+
+/// A new branch's `id`: 16 random hex characters.
+pub fn new_branch_id() -> String {
+    format!(
+        "{:016x}",
+        getrandom::u64().expect("the OS random source works")
+    )
 }
 
 impl fmt::Display for BranchName {
@@ -88,13 +117,30 @@ pub struct BranchRef {
     pub log_hint: Option<Location>,
     /// `None` for a branch made by `import`.
     pub forked_from: Option<ForkedFrom>,
-    /// For each branch merged into this one (R7): the commit of it merged last, the base for
-    /// its next merge. Kept by forks, and a GC root.
+    /// For each branch merged into this one (R7), by its [key](BranchRef::key): the commit of
+    /// it merged last, the base for its next merge. Kept by forks, and a GC root.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty", with = "id_map")]
     pub merge_bases: BTreeMap<String, Id>,
+    /// Set when the branch is created (v0.6) and kept across renames; see [`BranchRef::key`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Set by `ctm branch delete` just before the ref is removed: readers treat it as gone, and
+    /// a push that races the delete fails its CAS (and auto-forks) instead of being lost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<String>,
     pub updated_at: String,
     /// `"<user>@<hostname>/<machine-id>"`.
     pub updated_by: String,
+}
+
+impl BranchRef {
+    /// What merge bases and fork points know this branch by: its `id`, or for a branch made
+    /// before v0.6, the name it was created with (`name`, unless it was since renamed, which
+    /// sets `id` to that name). Never a valid ID and a branch name at once: IDs are 16 hex
+    /// characters, which names can't be.
+    pub fn key(&self, name: &BranchName) -> String {
+        self.id.clone().unwrap_or_else(|| name.to_string())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -105,6 +151,33 @@ pub struct ForkedFrom {
     #[serde(with = "id_hex")]
     pub commit: Id,
     pub at: String,
+    /// The [key](BranchRef::key) of the branch forked from (v0.6); absent for a snapshot or
+    /// commit, and for forks made before v0.6.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+}
+
+impl ForkedFrom {
+    /// The key of the branch forked from: `id`, or the name for a fork made before v0.6.
+    pub fn parent_key(&self) -> &str {
+        self.id.as_deref().unwrap_or(&self.from)
+    }
+}
+
+/// What `ctm branch delete` leaves for `undelete`, and GC keeps the branch's data for.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BranchTombstone {
+    pub deleted_at: String,
+    pub deleted_by: String,
+    pub branch: BranchRef,
+}
+
+/// What `ctm snapshot delete` leaves.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotTombstone {
+    pub deleted_at: String,
+    pub deleted_by: String,
+    pub snapshot: SnapshotRef,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
