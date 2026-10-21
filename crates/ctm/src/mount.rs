@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
-use ctm_fs::{CommitOutcome, MountOptions, MountState, PushOutcome, fuse};
+use ctm_fs::{CommitOutcome, MountOptions, MountState, PushOutcome, UpdateOutcome, fuse};
 use ctm_repo::{RefSpec, refspec::RefTarget};
 
 use crate::Result;
@@ -291,11 +291,14 @@ pub async fn run(state_dir: PathBuf) -> Result<()> {
         record.spec = branch.to_string();
         record.save()?;
     }
-    let mut background = vec![tokio::spawn(record_loop(
-        state.clone(),
-        record.mount_id.clone(),
-        record.spec.clone(),
-    ))];
+    let mut background = vec![
+        tokio::spawn(record_loop(
+            state.clone(),
+            record.mount_id.clone(),
+            record.spec.clone(),
+        )),
+        tokio::spawn(follow_loop(state.clone())),
+    ];
     if !state.read_only() && config.gc.auto_hours > 0 {
         background.push(tokio::spawn(gc_loop(record.repo.clone(), config.clone())));
     }
@@ -537,6 +540,79 @@ async fn sync(state: &MountState, record: &MountRecord, commit_first: bool) -> R
     }
 }
 
+async fn update(state: &MountState, record: &MountRecord) -> Response {
+    if !state.read_only()
+        && let Err(e) = state.wait_pushed().await
+    {
+        return error(e);
+    }
+    let branch = branch_of(state, record);
+    match state.update().await {
+        Ok(UpdateOutcome::UpToDate) => ok(format!("Up to date with {branch}")),
+        Ok(UpdateOutcome::Updated { commit, changed }) => ok(format!(
+            "Updated to {branch} (commit {}): {changed} entr{} changed",
+            &commit.to_hex()[..12],
+            if changed == 1 { "y" } else { "ies" }
+        )),
+        Ok(UpdateOutcome::Conflicts(paths)) => error(conflict_message(&branch, &paths)),
+        Ok(UpdateOutcome::Unpushed) => error("commits are still waiting to be pushed; try again"),
+        Ok(UpdateOutcome::Gone) => error(format!("{branch} no longer exists")),
+        Err(e) => error(e),
+    }
+}
+
+fn conflict_message(branch: &str, paths: &[String]) -> String {
+    let shown: Vec<&str> = paths.iter().take(5).map(String::as_str).collect();
+    format!(
+        "{branch} changed {} path{} that also changed here ({}{}); nothing was updated. Commit \
+         here and the push goes to an auto-fork you can merge, or `ctm restore` them first",
+        paths.len(),
+        if paths.len() == 1 { "" } else { "s" },
+        shown.join(", "),
+        if paths.len() > 5 { ", …" } else { "" }
+    )
+}
+
+/// How often a mount checks whether its branch moved (one HEAD request).
+const FOLLOW_EVERY: Duration = Duration::from_secs(5);
+
+/// Keeps a mount of a branch at the branch's head as other machines push to it, keeping
+/// uncommitted changes. A conflict is reported once per head; the mount then stays as it is
+/// until it's resolved or auto-forks.
+async fn follow_loop(state: Arc<MountState>) {
+    let mut reported = None;
+    loop {
+        tokio::time::sleep(FOLLOW_EVERY).await;
+        let Some(branch) = state.branch() else {
+            return;
+        };
+        if !matches!(state.behind().await, Ok(true)) {
+            continue;
+        }
+        let head = state
+            .repo()
+            .backend()
+            .head(&branch.branch_key())
+            .await
+            .ok()
+            .flatten();
+        if head.is_some() && head == reported {
+            continue;
+        }
+        match state.update().await {
+            Ok(UpdateOutcome::Updated { changed, .. }) => {
+                tracing::info!("followed {branch}: {changed} entries changed");
+            }
+            Ok(UpdateOutcome::Conflicts(paths)) => {
+                tracing::warn!("{}", conflict_message(branch.as_str(), &paths));
+                reported = head;
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("following {branch}: {e}"),
+        }
+    }
+}
+
 async fn handle(
     state: &MountState,
     record: &mut MountRecord,
@@ -591,6 +667,7 @@ async fn handle(
             }
         }
         Request::Sync { commit } => (sync(state, record, *commit).await, false),
+        Request::Update => (update(state, record).await, false),
         Request::Unmount { wait } => {
             if !state.read_only() {
                 // Committing is local, so it only fails on a local problem.
@@ -705,6 +782,28 @@ pub async fn sync_branch(branch: &str) -> Result<()> {
         }
         call(&record, &Request::Sync { commit: true }).await?;
     }
+    Ok(())
+}
+
+/// Brings this machine's mounts of `branch` up to its head (after a merge or reset here).
+/// Returns a line per mount.
+pub async fn update_branch(branch: &str) -> Result<Vec<String>> {
+    let mut out = Vec::new();
+    for record in records() {
+        if record.spec != branch || !alive(&record).await {
+            continue;
+        }
+        let at = record.mountpoint.display().to_string();
+        match control::call(&record.socket(), &Request::Update).await? {
+            Response::Ok { message } => out.push(format!("{at}: {message}")),
+            Response::Error { message } => out.push(format!("{at}: not updated: {message}")),
+        }
+    }
+    Ok(out)
+}
+
+pub async fn update_cmd(dir: &Path) -> Result<()> {
+    println!("{}", call(&mount_at(dir)?, &Request::Update).await?);
     Ok(())
 }
 

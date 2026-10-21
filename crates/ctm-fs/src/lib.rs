@@ -9,11 +9,13 @@ mod fetch;
 pub mod fuse;
 mod inode;
 mod state;
+mod update;
 
 pub use state::{
     Attr, CommitOutcome, DirItem, Fh, FileKind, Invalidate, MountOptions, MountState, PushOutcome,
     SetAttr, StatFs, Status,
 };
+pub use update::UpdateOutcome;
 
 /// Whether a mount's working-state directory holds uncommitted changes or unpushed commits.
 pub fn has_local_changes(state_dir: &std::path::Path) -> Result<bool> {

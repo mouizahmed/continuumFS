@@ -917,15 +917,15 @@ fn an_auto_fork_merges_back_into_its_branch() {
     );
     env.ok(&["unmount", &env.path("b")]);
 
-    let err = env.fails(&["merge", &fork, "--into", "main"]);
-    assert!(err.contains("mounted read-write"), "{err}");
-    env.ok(&["unmount", &env.path("a")]);
-
-    // notes.txt changed on both sides: refused, then both kept.
+    // notes.txt changed on both sides: refused, then both kept, and the mount of main
+    // follows the merge.
     let err = env.fails(&["merge", &fork, "--into", "main"]);
     assert!(err.contains("1 conflicting path"), "{err}");
     let out = env.ok(&["merge", &fork, "--into", "main", "--keep-both"]);
     assert!(out.contains(&format!("Merged {fork} into main")), "{out}");
+    assert!(out.contains("Updated to main"), "{out}");
+    assert_eq!(fs::read_to_string(a.join("from-b.txt")).unwrap(), "b\n");
+    env.ok(&["unmount", &env.path("a")]);
     assert_eq!(env.ok(&["cat", "main:from-a.txt"]), "a\n");
     assert_eq!(env.ok(&["cat", "main:from-b.txt"]), "b\n");
     assert_eq!(env.ok(&["cat", "main:notes.txt"]), "edited on a\n");
@@ -959,7 +959,6 @@ fn a_mount_whose_branch_is_deleted_elsewhere_auto_forks() {
     for args in [
         vec!["branch", "delete", "main"],
         vec!["branch", "rename", "main", "x"],
-        vec!["reset", "main", "--to", "main"],
     ] {
         let err = env.fails(&args);
         assert!(err.contains("mounted read-write"), "{err}");
@@ -1021,4 +1020,64 @@ fn a_mount_whose_branch_is_deleted_elsewhere_auto_forks() {
         env.ok(&["cat", "snap/v1:after.txt"]),
         "written after the delete\n"
     );
+}
+
+/// v0.6: a mount follows its branch as other mounts push to it, keeping its own uncommitted
+/// changes; `ctm update` does it at once, and a reset updates mounts of the branch.
+#[test]
+fn mounts_follow_their_branch() {
+    if !fuse_available() {
+        return;
+    }
+    let env = Env::new();
+    repo_with_main(&env);
+    let (a, b) = (env.work.join("a"), env.work.join("b"));
+    fs::create_dir(&a).unwrap();
+    fs::create_dir(&b).unwrap();
+    env.ok(&["mount", "main", &env.path("a")]);
+    env.ok(&["mount", "main", &env.path("b")]);
+    assert_eq!(fs::read_to_string(b.join("notes.txt")).unwrap(), "hello\n");
+    fs::write(b.join("draft.txt"), "uncommitted on b\n").unwrap();
+
+    fs::write(a.join("notes.txt"), "edited on a\n").unwrap();
+    fs::write(a.join("new.txt"), "new on a\n").unwrap();
+    env.ok(&["commit", &env.path("a")]);
+    env.ok(&["sync", &env.path("a")]);
+
+    // b follows on its own within seconds.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while fs::read_to_string(b.join("notes.txt")).unwrap() != "edited on a\n" {
+        assert!(std::time::Instant::now() < deadline, "b didn't follow");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert_eq!(fs::read_to_string(b.join("new.txt")).unwrap(), "new on a\n");
+    assert_eq!(
+        fs::read_to_string(b.join("draft.txt")).unwrap(),
+        "uncommitted on b\n"
+    );
+    let status = env.ok(&["status", &env.path("b")]);
+    assert!(!status.contains("Behind"), "{status}");
+
+    // b's commit lands on main, not an auto-fork; a catches up with `ctm update`.
+    env.ok(&["commit", &env.path("b")]);
+    env.ok(&["sync", &env.path("b")]);
+    assert_eq!(env.ok(&["branch", "list"]), "main\n");
+    let out = env.ok(&["update", &env.path("a")]);
+    assert!(
+        out.contains("Updated to main") || out.contains("Up to date"),
+        "{out}"
+    );
+    assert_eq!(
+        fs::read_to_string(a.join("draft.txt")).unwrap(),
+        "uncommitted on b\n"
+    );
+
+    // A reset moves both mounts back.
+    let first = env.ok(&["log", "main"]).lines().last().unwrap()[..12].to_string();
+    let out = env.ok(&["reset", "main", "--to", &first]);
+    assert_eq!(out.matches("Updated to main").count(), 2, "{out}");
+    assert_eq!(fs::read_to_string(a.join("notes.txt")).unwrap(), "hello\n");
+    assert!(!b.join("new.txt").exists());
+    env.ok(&["unmount", &env.path("a")]);
+    env.ok(&["unmount", &env.path("b")]);
 }

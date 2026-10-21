@@ -218,13 +218,17 @@ pub async fn branch_rename(old: &str, new: &str) -> Result<()> {
 }
 
 pub async fn reset(branch: &str, to: &str) -> Result<()> {
-    refuse_mounted(branch, "reset").await?;
+    // Mounts of the branch push first (so their work is in the log), then follow the reset.
+    crate::mount::sync_branch(branch).await?;
     let repo = open_repo().await?;
     let r = repo.reset(&BranchName::new(branch)?, &to.parse()?).await?;
     println!(
         "Reset {branch} to {to} (commit {}); the old head stays in `ctm log {branch}`",
         short(&r.head)
     );
+    for line in crate::mount::update_branch(branch).await? {
+        println!("{line}");
+    }
     Ok(())
 }
 
@@ -388,16 +392,11 @@ pub async fn merge(
     dry_run: bool,
 ) -> Result<()> {
     let (src_name, dst_name) = (BranchName::new(src)?, BranchName::new(dst)?);
-    if !dry_run && let Some(at) = crate::mount::mounted_rw(dst).await {
-        return Err(format!(
-            "{dst} is mounted read-write at {}; unmount it first (merging into it would make \
-             that mount auto-fork on its next push)",
-            at.display()
-        )
-        .into());
-    }
-    // What's written in a mount of src counts.
+    // What's written in mounts of either counts; mounts of dst are updated afterwards.
     crate::mount::sync_branch(src).await?;
+    if !dry_run {
+        crate::mount::sync_branch(dst).await?;
+    }
     let repo = open_repo().await?;
     let opts = ctm_repo::MergeOptions { resolve, dry_run };
     match repo.merge(&src_name, &dst_name, &opts).await? {
@@ -429,6 +428,11 @@ pub async fn merge(
             match commit {
                 Some(c) => println!("Merged {src} into {dst} (commit {})", short(&c)),
                 None => println!("Would merge {src} into {dst} (dry run)"),
+            }
+            if commit.is_some() {
+                for line in crate::mount::update_branch(dst).await? {
+                    println!("{line}");
+                }
             }
         }
     }

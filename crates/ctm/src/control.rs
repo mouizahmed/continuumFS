@@ -26,6 +26,8 @@ pub enum Request {
     Unmount {
         wait: bool,
     },
+    /// Waits for pushes, then brings the mount up to its branch's head (v0.6).
+    Update,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

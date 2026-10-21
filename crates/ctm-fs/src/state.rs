@@ -561,7 +561,7 @@ impl MountState {
         *self.notify.lock().unwrap() = Some(f);
     }
 
-    fn invalidate(&self, i: Invalidate) {
+    pub(crate) fn invalidate(&self, i: Invalidate) {
         if let Some(f) = self.notify.lock().unwrap().as_ref() {
             f(i);
         }
@@ -1558,12 +1558,7 @@ impl MountState {
             (inner.base.clone(), (changed + inner.whiteouts.len()) as u64)
         };
         let (unpushed, oldest_unpushed_ns) = self.unpushed()?;
-        let behind = match (&base.branch, &base.etag) {
-            (Some(b), Some(etag)) => {
-                self.repo.backend().head(&b.branch_key()).await?.as_ref() != Some(etag)
-            }
-            _ => false,
-        };
+        let behind = self.behind().await?;
         Ok(Status {
             branch: base.branch,
             base_commit: base.commit,
@@ -1578,6 +1573,17 @@ impl MountState {
 
     /// Replaces the entry at `path` with the one in `from`, and invalidates the kernel's
     /// cache of it.
+    /// Whether the branch has moved since this mount's base (one HEAD request).
+    pub async fn behind(&self) -> Result<bool> {
+        let base = self.lock().base.clone();
+        Ok(match (&base.branch, &base.etag) {
+            (Some(b), Some(etag)) => {
+                self.repo.backend().head(&b.branch_key()).await?.as_ref() != Some(etag)
+            }
+            _ => false,
+        })
+    }
+
     pub async fn restore(&self, path: &[u8], from: &RefSpec) -> Result<()> {
         let _gate = self.gate.read().await;
         self.writable().map_err(io_errno)?;

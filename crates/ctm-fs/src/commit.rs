@@ -284,6 +284,11 @@ impl MountState {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
+        // Commit on top of the branch's head if it moved, so the push lands instead of
+        // auto-forking. Offline, or on a conflict, the commit goes ahead as it is.
+        if matches!(self.behind().await, Ok(true)) {
+            let _ = self.update().await;
+        }
         let _gate = self.gate.write().await;
         let snap = self.snapshot();
         if !snap.nodes.contains_key(&ROOT) {

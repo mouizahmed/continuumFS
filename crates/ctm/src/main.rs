@@ -112,6 +112,9 @@ enum Command {
         #[arg(long)]
         stat: bool,
     },
+    /// Bring a mount up to its branch's head, keeping uncommitted changes (mounts also do it on
+    /// their own within seconds)
+    Update { dir: PathBuf },
     /// Point a branch back at another ref's commit (the old head stays in its log)
     Reset {
         branch: String,
@@ -235,6 +238,7 @@ async fn run(command: Command) -> Result<()> {
             commands::branch_rename(&old, &new).await
         }
         Command::Reset { branch, to } => commands::reset(&branch, &to).await,
+        Command::Update { dir } => mount::update_cmd(&dir).await,
         Command::Snapshot(SnapshotCommand::Create { name, from }) => {
             commands::snapshot_create(&name, from.as_deref()).await
         }
