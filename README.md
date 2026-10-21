@@ -227,6 +227,19 @@ entry. An entry changed on one side takes that side; one changed differently on 
 conflict, refused unless resolved with `--ours`, `--theirs`, or `--keep-both`. An auto-fork
 merges back with `ctm merge main.<host> --into main`.
 
+**Against DVC and Git LFS** (same bucket, same machine, 12 GiB of data;
+[details](bench/results/r11-dvc-lfs.md)):
+
+| | ctm | DVC | Git LFS |
+|---|---|---|---|
+| Edit 1 MiB of a 10 GiB file, then push | **1.8 s, 3.4 MiB sent** | 140 s, 10.09 GiB | 472 s, 10.03 GiB |
+| Bucket after that edit and 10 dataset versions | **12.35 GiB** | 22.35 GiB | 22.34 GiB |
+| Fresh machine: read all 12 GiB | **187 s** | 238 s | 441 s |
+| Fresh machine: read one 512 KiB image | 1.6–2.3 s | 2.2–2.6 s | **0.8–0.9 s** |
+| New dataset version (80 whole images), median | 7.0 s | 7.0 s | **3.4 s** |
+
+Whole-file changes cost the same in all three; the difference is edits inside large files.
+
 ## Development
 
 ```sh
