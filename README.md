@@ -23,7 +23,7 @@ that changed.
 
 It is written in Rust as a single binary (`ctm`), Apache-2.0.
 
-> **Status: v0.5.** Linux only (x86_64 and aarch64). The storage format is versioned: repos
+> **Status: v0.6.** Linux only (x86_64 and aarch64). The storage format is versioned: repos
 > written by this version stay readable by later ones, not the other way round. See
 > [Limits](#limits).
 
@@ -35,13 +35,13 @@ the static binary for your architecture from the
 
 ```sh
 arch=$(uname -m)   # x86_64 or aarch64
-curl -fsSL https://github.com/mouizahmed/continuumFS/releases/download/v0.5.0/ctm-0.5.0-$arch-unknown-linux-musl.tar.gz \
-  | tar -xz --strip-components=1 -C ~/.local/bin ctm-0.5.0-$arch-unknown-linux-musl/ctm
+curl -fsSL https://github.com/mouizahmed/continuumFS/releases/download/v0.6.0/ctm-0.6.0-$arch-unknown-linux-musl.tar.gz \
+  | tar -xz --strip-components=1 -C ~/.local/bin ctm-0.6.0-$arch-unknown-linux-musl/ctm
 ctm --version
 ```
 
 Or build it from source with Rust 1.98 or newer:
-`cargo install --git https://github.com/mouizahmed/continuumFS --tag v0.5.0 ctm`.
+`cargo install --git https://github.com/mouizahmed/continuumFS --tag v0.6.0 ctm`.
 
 Try it without any cloud account, with a repo in a local directory:
 
@@ -244,7 +244,7 @@ merges back with `ctm merge main.<host> --into main`.
 
 Whole-file changes cost the same in all three; the difference is edits inside large files.
 
-**Since v0.5** (unreleased, on `main`): mounts follow their branch, picking up other machines'
+**In v0.6:** mounts follow their branch, picking up other machines'
 pushes within seconds while keeping uncommitted changes (`ctm update` does it at once); `ctm
 merge` and `ctm reset` update mounts of the branch too. Branches and snapshots can be deleted and
 undeleted for 7 days, and branches renamed; `ctm reset` points a branch back. Mounts run GC once
