@@ -331,7 +331,11 @@ async fn one_run_at_a_time_and_a_stale_lease_is_taken_over() {
         ..now_opts()
     };
     repo.gc(&stale).await.unwrap();
-    assert!(be.list("locks/").await.unwrap().is_empty());
+    assert_eq!(
+        be.list("locks/").await.unwrap(),
+        ["locks/gc-last"],
+        "only the finish time"
+    );
 }
 
 #[tokio::test]
@@ -351,4 +355,22 @@ async fn a_dry_run_changes_nothing() {
     let report = repo.gc(&dry).await.unwrap();
     assert!(report.deleted_objects > 0, "{report:?}");
     assert_eq!(be.list("").await.unwrap(), keys);
+}
+
+#[tokio::test]
+async fn a_run_records_when_it_finished_and_a_dry_run_does_not() {
+    let be = Arc::new(MemBackend::new());
+    let repo = Repo::init(be, identity()).await.unwrap().0;
+    import(&repo, "main", &[("a", b"a")]).await;
+    assert_eq!(repo.last_gc().await.unwrap(), None);
+    let dry = GcOptions {
+        dry_run: true,
+        ..now_opts()
+    };
+    repo.gc(&dry).await.unwrap();
+    assert_eq!(repo.last_gc().await.unwrap(), None);
+    let before = ctm_repo::now_ns();
+    repo.gc(&now_opts()).await.unwrap();
+    let last = repo.last_gc().await.unwrap().unwrap();
+    assert!(last >= before - 1_000_000_000, "{last} vs {before}");
 }

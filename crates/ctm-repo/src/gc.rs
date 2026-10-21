@@ -118,6 +118,14 @@ struct Lease {
 }
 
 const LOCK: &str = "locks/gc";
+/// When the last run finished (v0.6): mounts run GC when it's older than a day.
+const LAST_RUN: &str = "locks/gc-last";
+
+#[derive(Serialize, Deserialize)]
+struct LastRun {
+    finished_at: String,
+    by: String,
+}
 
 fn random_hex() -> String {
     let mut b = [0u8; 8];
@@ -180,6 +188,16 @@ impl Repo {
         }
         let lease = self.take_lease(opts).await?;
         let result = Gc { repo: self, opts }.run().await;
+        if result.is_ok() {
+            let last = LastRun {
+                finished_at: rfc3339(now_ns()),
+                by: self.identity().updated_by(),
+            };
+            let body = serde_json::to_vec_pretty(&last).expect("serializes");
+            self.backend()
+                .put(LAST_RUN, body.into(), PutMode::Overwrite)
+                .await?;
+        }
         // Only our own lease: a run that took it over as stale owns it now.
         if let Ok((body, _)) = self.backend().get(LOCK).await
             && serde_json::from_slice::<Lease>(&body).is_ok_and(|l| l.run_id == lease)
@@ -187,6 +205,17 @@ impl Repo {
             self.backend().delete(LOCK).await?;
         }
         result
+    }
+
+    /// When the last GC run finished (unix nanoseconds); `None` if none has since v0.6.
+    pub async fn last_gc(&self) -> Result<Option<i64>> {
+        match self.backend().get(LAST_RUN).await {
+            Ok((body, _)) => Ok(serde_json::from_slice::<LastRun>(&body)
+                .ok()
+                .and_then(|l| parse_rfc3339(&l.finished_at))),
+            Err(ctm_store::Error::NotFound(_)) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     async fn take_lease(&self, opts: &GcOptions) -> Result<String> {

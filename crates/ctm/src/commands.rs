@@ -312,15 +312,23 @@ pub async fn diff(a: &str, b: &str, stat: bool) -> Result<()> {
     Ok(())
 }
 
+/// GC options from this machine's `[retention]` settings.
+pub fn gc_options(config: &LocalConfig) -> ctm_repo::GcOptions {
+    let days = |d: u64| std::time::Duration::from_secs(d * 86_400);
+    ctm_repo::GcOptions {
+        auto_retention: days(config.retention.auto_days),
+        manual_retention: (config.retention.manual_days > 0)
+            .then(|| days(config.retention.manual_days)),
+        ..ctm_repo::GcOptions::default()
+    }
+}
+
 pub async fn gc(dry_run: bool, grace_secs: Option<u64>) -> Result<()> {
     let config = load_config()?;
     let repo = open_repo().await?;
     let mut opts = ctm_repo::GcOptions {
-        auto_retention: std::time::Duration::from_secs(config.retention.auto_days * 86_400),
-        manual_retention: (config.retention.manual_days > 0)
-            .then(|| std::time::Duration::from_secs(config.retention.manual_days * 86_400)),
         dry_run,
-        ..ctm_repo::GcOptions::default()
+        ..gc_options(&config)
     };
     if let Some(s) = grace_secs {
         opts.grace = std::time::Duration::from_secs(s);

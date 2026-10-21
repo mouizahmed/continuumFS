@@ -16,7 +16,7 @@ use ctm_fs::{CommitOutcome, MountOptions, MountState, PushOutcome, fuse};
 use ctm_repo::{RefSpec, refspec::RefTarget};
 
 use crate::Result;
-use crate::commands::{identity, load_config, open_at};
+use crate::commands::{gc_options, identity, load_config, open_at};
 use crate::config::RepoEntry;
 use crate::control::{self, Request, Response};
 use crate::paths;
@@ -296,6 +296,9 @@ pub async fn run(state_dir: PathBuf) -> Result<()> {
         record.mount_id.clone(),
         record.spec.clone(),
     ))];
+    if !state.read_only() && config.gc.auto_hours > 0 {
+        background.push(tokio::spawn(gc_loop(record.repo.clone(), config.clone())));
+    }
     if !state.read_only() {
         background.extend([
             tokio::spawn(push_loop(state.clone(), state_dir.clone())),
@@ -437,6 +440,54 @@ async fn record_loop(state: Arc<MountState>, mount_id: String, spec: String) {
             _ = tokio::time::sleep(Duration::from_secs(3600)) => {}
         }
     }
+}
+
+/// Runs GC when the repo's last run finished more than `[gc] auto_hours` ago, checking 10–20
+/// minutes after the mount starts and hourly after that. Uses a repo handle of its own: the
+/// mount's writes go through its outgoing packs, which GC's mustn't.
+async fn gc_loop(entry: RepoEntry, config: crate::config::LocalConfig) {
+    let jitter = Duration::from_secs(u64::from(std::process::id() % 600));
+    tokio::time::sleep(Duration::from_secs(600) + jitter).await;
+    let max_age = Duration::from_secs(config.gc.auto_hours * 3600).as_nanos() as i64;
+    loop {
+        if let Err(e) = gc_if_due(&entry, &config, max_age).await {
+            tracing::warn!("background GC: {e}");
+        }
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+    }
+}
+
+/// Errors as strings: the loop runs on a spawned task, so they must be `Send`.
+async fn gc_if_due(
+    entry: &RepoEntry,
+    config: &crate::config::LocalConfig,
+    max_age: i64,
+) -> std::result::Result<(), String> {
+    let backend =
+        ctm_store::open(&entry.url, entry.endpoint.as_deref()).map_err(|e| e.to_string())?;
+    let identity = identity(config).map_err(|e| e.to_string())?;
+    let repo = open_at(backend, identity)
+        .await
+        .map_err(|e| e.to_string())?;
+    if repo
+        .last_gc()
+        .await
+        .map_err(|e| e.to_string())?
+        .is_some_and(|t| ctm_repo::now_ns() - t < max_age)
+    {
+        return Ok(());
+    }
+    match repo.gc(&gc_options(config)).await {
+        Ok(r) => tracing::info!(
+            "background GC: {} commits dropped, {} objects deleted",
+            r.dropped_commits,
+            r.deleted_objects
+        ),
+        // Another machine is running it.
+        Err(ctm_repo::Error::AlreadyExists(_)) => {}
+        Err(e) => return Err(e.to_string()),
+    }
+    Ok(())
 }
 
 /// Commits on its own once the mount has been quiet for `quiet`, or dirty for `max_dirty`.

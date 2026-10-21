@@ -20,6 +20,8 @@ pub struct LocalConfig {
     pub commit: CommitConfig,
     #[serde(default)]
     pub retention: RetentionConfig,
+    #[serde(default)]
+    pub gc: GcConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -79,6 +81,20 @@ impl Default for RetentionConfig {
             auto_days: 14,
             manual_days: 0,
         }
+    }
+}
+
+/// When read-write mounts run GC on their own (v0.6).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GcConfig {
+    /// A mount runs GC when the repo's last run finished more than this many hours ago (it
+    /// checks hourly; the GC lease keeps it to one run at a time). 0 turns it off.
+    pub auto_hours: u64,
+}
+
+impl Default for GcConfig {
+    fn default() -> GcConfig {
+        GcConfig { auto_hours: 24 }
     }
 }
 
